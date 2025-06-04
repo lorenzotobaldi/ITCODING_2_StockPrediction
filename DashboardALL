@@ -1,0 +1,3812 @@
+import sys
+import os
+import datetime
+import time
+import numpy as np
+import pandas as pd
+import warnings
+import threading
+import queue
+import re
+from io import StringIO
+import pyreadstat
+from cryptography.fernet import Fernet
+
+# Configure matplotlib to use the Qt6Agg backend compatible with PySide6
+import matplotlib
+
+matplotlib.use('QtAgg')
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QPushButton, QLabel, QComboBox, QFileDialog, QTabWidget, QTableView,
+    QMessageBox, QLineEdit, QFrame, QSplitter, QMenu, QProgressBar,
+    QListWidget, QAbstractItemView, QScrollArea, QSpinBox, QCheckBox,
+    QRadioButton, QGroupBox, QStatusBar, QTreeWidget, QTreeWidgetItem,
+    QHeaderView, QTextEdit, QStackedWidget, QSizePolicy, QDialog, QDialogButtonBox, QWizard,
+    QWizardPage, QListWidgetItem, QButtonGroup
+)
+from PySide6.QtCore import (
+    Qt, QAbstractTableModel, QSortFilterProxyModel, Signal, Slot, QThread,
+    QObject, QModelIndex, QItemSelectionModel, QSize, QTimer
+)
+from PySide6.QtGui import (
+    QFont, QIcon, QColor, QPalette, QPixmap, QFontMetrics, QStandardItemModel,
+    QStandardItem, QTextCursor, QTextDocument
+)
+
+# Definisci i colori personalizzati da utilizzare nell'app
+VERDE_SCURO = "#008037"
+BLU_PETROLIO = "#072A40"
+BIANCO = "#FFFFFF"
+GRIGIO_CHIARO = "#F2F4F7"
+VERDE_CHIARO = "#31C46D"
+
+# Ignora avvertimenti
+warnings.filterwarnings('ignore')
+
+DATABASE_CLAIMS_PATH = ""
+DATABASE_EXPOSITION_PATH = ""
+OUTPUT_PATH = ""
+CLUSTER_COLUMN = ""
+
+# Costante per piantare il DecCutPoint a 1
+DEC_CUT_POINT = 0
+
+# Dizionario per la maschera delle compagnie
+COMPANY_MASKS = {}
+
+
+def ensure_dir(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+
+def _clear(tab):
+    """Svuota (senza sostituire) il layout principale del tab."""
+    lay = tab.layout()
+    while lay.count():
+        child = lay.takeAt(0)
+        if child.widget():
+            child.widget().deleteLater()
+    return lay
+
+
+def _pct(val):
+    try:
+        return f"{float(val):.2%}"
+    except (ValueError, TypeError):
+        return ""
+
+
+def _num(val):
+    try:
+        return f"{float(val):,.2f}"
+    except (ValueError, TypeError):
+        return ""
+
+
+# ======= CreateClusterDialog (modificato) =======
+class CreateClusterDialog(QDialog):
+    """Dialog per creare una colonna cluster combinando più colonne comuni"""
+
+    def __init__(self, common_columns, parent=None):
+        super().__init__(parent)
+
+        self.setWindowTitle("Creazione Colonna Cluster")
+        self.setMinimumSize(600, 400)
+        self.common_columns = common_columns
+        self.selected_columns = []
+
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Titolo e descrizione
+        title_label = QLabel("Crea una colonna cluster combinando più colonne")
+        title_label.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {BLU_PETROLIO};")
+        layout.addWidget(title_label)
+
+        info_label = QLabel(
+            "Seleziona una o più colonne comuni tra i database Claims ed Exposition.\n"
+            "Queste colonne verranno combinate per creare una colonna 'Cluster'."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Lista colonne disponibili
+        columns_group = QGroupBox("Colonne disponibili")
+        columns_layout = QVBoxLayout(columns_group)
+
+        # Barra di ricerca
+        search_frame = QFrame()
+        search_layout = QHBoxLayout(search_frame)
+        search_layout.setContentsMargins(0, 0, 0, 10)
+
+        search_layout.addWidget(QLabel("Cerca:"))
+        self.search_field = QLineEdit()
+        self.search_field.setPlaceholderText("Filtra le colonne...")
+        self.search_field.textChanged.connect(self.filter_columns)
+        search_layout.addWidget(self.search_field)
+
+        columns_layout.addWidget(search_frame)
+
+        # Lista colonne con checkbox
+        self.columns_list = QListWidget()
+        self.columns_list.setSelectionMode(QAbstractItemView.MultiSelection)
+
+        for column in self.common_columns:
+            item = QListWidgetItem(column)
+            item.setCheckState(Qt.Unchecked)
+            self.columns_list.addItem(item)
+
+        self.columns_list.itemChanged.connect(self.on_selection_changed)
+        columns_layout.addWidget(self.columns_list)
+
+        layout.addWidget(columns_group)
+
+        # Preview del nome cluster (fisso in 'Cluster')
+        preview_group = QGroupBox("Anteprima nome cluster")
+        preview_layout = QVBoxLayout(preview_group)
+
+        self.preview_label = QLabel("Seleziona almeno una colonna")
+        self.preview_label.setStyleSheet("font-style: italic;")
+        preview_layout.addWidget(self.preview_label)
+
+        layout.addWidget(preview_group)
+
+        # Pulsanti
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.validate_and_accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        # Disabilita OK finché non viene selezionata almeno una colonna
+        self.ok_button = button_box.button(QDialogButtonBox.Ok)
+        self.ok_button.setEnabled(False)
+
+    def filter_columns(self, text):
+        """Filtra l'elenco delle colonne"""
+        for i in range(self.columns_list.count()):
+            item = self.columns_list.item(i)
+            item.setHidden(text.lower() not in item.text().lower())
+
+    def on_selection_changed(self, item):
+        """Gestisce il cambio di selezione"""
+        self.selected_columns = []
+        for i in range(self.columns_list.count()):
+            list_item = self.columns_list.item(i)
+            if list_item.checkState() == Qt.Checked:
+                self.selected_columns.append(list_item.text())
+
+        self.update_preview()
+        self.ok_button.setEnabled(len(self.selected_columns) > 0)
+
+    def update_preview(self):
+        """Aggiorna l'anteprima del nome cluster (fisso: 'Cluster')"""
+        if self.selected_columns:
+            self.preview_label.setText("Nome cluster: Cluster")
+            self.preview_label.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.preview_label.setText("Seleziona almeno una colonna")
+            self.preview_label.setStyleSheet("font-style: italic;")
+
+    def validate_and_accept(self):
+        """Valida e accetta la selezione"""
+        if not self.selected_columns:
+            QMessageBox.warning(self, "Nessuna selezione", "Seleziona almeno una colonna.")
+            return
+
+        self.accept()
+
+    def get_cluster_configuration(self):
+        """Restituisce la configurazione del cluster: solo le colonne selezionate"""
+        return {
+            'columns': self.selected_columns
+        }
+
+
+class FileSelectionWizard(QWizard):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.setWindowTitle("Selezione Database")
+        self.setWizardStyle(QWizard.ModernStyle)
+        self.setMinimumSize(800, 600)
+
+        # Salva le colonne selezionate
+        self.claims_columns = []
+        self.exposition_columns = []
+        self.cluster_configuration = None
+
+        # File caricati
+        self.claims_files_loaded = []
+        self.exposition_files_loaded = []
+
+        # Inizializza le pagine del wizard
+        self.addPage(IntroPage())
+        self.addPage(DatabaseClaimsPage())
+        self.addPage(DatabaseExpositionPage())
+        self.addPage(ClusterCreationPage())
+        self.addPage(OutputFolderPage())
+
+        # Applica lo stile
+        self.setStyleSheet(f"""
+            QWizard {{
+                background-color: {BIANCO};
+            }}
+            QWizardPage {{
+                background-color: {BIANCO};
+            }}
+            QPushButton {{
+                background-color: {VERDE_SCURO};
+                color: {BIANCO};
+                padding: 8px 15px;
+                font-weight: bold;
+                border: none;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: {VERDE_CHIARO};
+            }}
+        """)
+
+    def find_common_columns(self):
+        """Trova le colonne comuni tra i database Claims ed Exposition"""
+        claims_columns = self.claims_columns if hasattr(self, 'claims_columns') else []
+        exposition_columns = self.exposition_columns if hasattr(self, 'exposition_columns') else []
+
+        # Trova l'intersezione tra le due liste di colonne
+        common_columns = list(set(claims_columns).intersection(set(exposition_columns)))
+
+        # IMPORTANTE: Rimuovi "Periodo di osservazione" dalle colonne selezionabili
+        columns_to_exclude = ['periodo di osservazione', 'periodo_di_osservazione', 'PERIODO DI OSSERVAZIONE', 'Antidurata arrotondata', 'antidurata arrotondata']
+        common_columns = [col for col in common_columns if col.lower() not in [ex.lower() for ex in columns_to_exclude]]
+
+        return sorted(common_columns)
+
+    def accept(self):
+        """Sovrascrivi il metodo di accettazione per salvare tutti i dati"""
+        global DATABASE_CLAIMS_PATH, DATABASE_EXPOSITION_PATH, OUTPUT_PATH, CLUSTER_COLUMN
+
+        claims_page = self.page(1)
+        exposition_page = self.page(2)
+        cluster_page = self.page(3)
+        output_page = self.page(4)
+
+        # Assegna valori
+        DATABASE_CLAIMS_PATH = claims_page.folder_path_label.text() if hasattr(claims_page, 'folder_path_label') else ""
+        DATABASE_EXPOSITION_PATH = exposition_page.folder_path_label.text() if hasattr(exposition_page,
+                                                                                       'folder_path_label') else ""
+        OUTPUT_PATH = output_page.file_path_label.text() if hasattr(output_page, 'file_path_label') else ""
+
+        # Salva la configurazione del cluster
+        if hasattr(cluster_page, 'cluster_configuration') and cluster_page.cluster_configuration:
+            CLUSTER_COLUMN = 'Cluster'
+            self.cluster_configuration = cluster_page.cluster_configuration
+
+        # Verifica percorsi
+        print(f"Verifica percorsi prima dell'accettazione:")
+        print(f"  Claims: '{DATABASE_CLAIMS_PATH}'")
+        print(f"  Exposition: '{DATABASE_EXPOSITION_PATH}'")
+        print(f"  Output: '{OUTPUT_PATH}'")
+        print(f"  Cluster Configuration: {self.cluster_configuration}")
+
+        # Messaggio di completamento
+        message = f"Hai selezionato:\n\n"
+        message += f"Cartella Database Riscatti: {DATABASE_CLAIMS_PATH}\n"
+        message += f"  File trovati: {len(self.claims_files_loaded)}\n"
+        message += f"Cartella Database Riserve: {DATABASE_EXPOSITION_PATH}\n"
+        message += f"  File trovati: {len(self.exposition_files_loaded)}\n"
+        if self.cluster_configuration:
+            message += f"Cluster: Cluster (basato su: {', '.join(self.cluster_configuration['columns'])})\n"
+        message += f"Cartella Output: {OUTPUT_PATH}"
+
+        QMessageBox.information(self, "Selezione Completata", message)
+
+        super().accept()
+
+
+class IntroPage(QWizardPage):
+    def __init__(self):
+        super().__init__()
+
+        self.setTitle("Benvenuto nella Lapse Results Analysis")
+        self.setSubTitle(
+            "Questo wizard ti guiderà nella selezione delle cartelle contenenti i database necessari per l'analisi")
+
+        layout = QVBoxLayout(self)
+
+        intro_text = QLabel(
+            "<p>Per procedere con l'analisi dei tassi di riscatto è necessario fornire due cartelle contenenti:</p>"
+            "<p><b>1. Database Riscatti:</b> cartella contenente i file con le informazioni sui riscatti effettuati</p>"
+            "<p><b>2. Database Riserve:</b> cartella contenente i file con i dati di esposizione</p>"
+            "<p>I file possono essere in formato <b>CSV (.csv)</b>, <b>TXT (.txt)</b>, <b>Excel (.xlsx)</b> o <b>SAS (.sas7bdat)</b></p>\n\n"
+            "<p>Tutti i file nella stessa cartella verranno automaticamente accodati per creare un database unificato.</p>"
+            "<p>Dopo il caricamento dei database, potrai creare una colonna <b>Cluster</b> combinando "
+            "le colonne comuni tra i due database per il raggruppamento dei dati.</p>"
+        )
+        intro_text.setWordWrap(True)
+
+        layout.addWidget(intro_text)
+        layout.addStretch()
+
+
+class DatabaseClaimsPage(QWizardPage):
+    def __init__(self):
+        super().__init__()
+
+        self.setTitle("Selezione Cartella Database Riscatti")
+        self.setSubTitle("Seleziona la cartella contenente i file dei riscatti")
+
+        self.registerField("claims_path*", self, "claimsPath", "claimsPathChanged")
+        self._claims_path = ""
+        self.column_names = []
+        self.files_info = []
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            "<p>Il <b>Database Riscatti</b> deve contenere le seguenti colonne:</p>"
+            "<ul>"
+            "<li><b>dtdatarif liquidato</b>: Data di riferimento del riscatto</li>"
+            "<li><b>Antidurata arrotondata</b>: Antidurata (1,2,3,4,5,6,7,8,9,10-15,15-20+)</li>"
+            "<li><b>nrpolizza</b>: Numero polizza</li>"
+            "<li><b>Classificazione</b>: Tipo di riscatto ('Uscita definitiva' o 'Riscatto reworkato')</li>"
+            "<li><b>Riscatto</b>: Importo del riscatto</li>"
+            "</ul>"
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        file_frame = QFrame()
+        file_layout = QHBoxLayout(file_frame)
+
+        self.folder_path_label = QLineEdit()
+        self.folder_path_label.setReadOnly(True)
+        self.folder_path_label.setPlaceholderText("Nessuna cartella selezionata")
+        file_layout.addWidget(self.folder_path_label, 1)
+
+        browse_button = QPushButton("Sfoglia...")
+        browse_button.clicked.connect(self.browse_folder)
+        file_layout.addWidget(browse_button)
+
+        layout.addWidget(file_frame)
+
+        # Lista file trovati
+        self.files_list_widget = QTextEdit()
+        self.files_list_widget.setReadOnly(True)
+        self.files_list_widget.setMaximumHeight(150)
+        layout.addWidget(QLabel("File trovati:"))
+        layout.addWidget(self.files_list_widget)
+
+        self.file_info_label = QLabel("")
+        layout.addWidget(self.file_info_label)
+
+        layout.addStretch()
+
+    def getClaimsPath(self):
+        return self._claims_path
+
+    def setClaimsPath(self, path):
+        if self._claims_path != path:
+            self._claims_path = path
+            self.claimsPathChanged.emit()
+
+    claimsPath = property(getClaimsPath, setClaimsPath)
+    claimsPathChanged = Signal()
+
+    def browse_folder(self):
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Seleziona Cartella Database Riscatti",
+            ""
+        )
+
+        if folder_path:
+            self.folder_path_label.setText(folder_path)
+            self._claims_path = folder_path
+            self.setField("claims_path", folder_path)
+
+            global DATABASE_CLAIMS_PATH
+            DATABASE_CLAIMS_PATH = folder_path
+
+            # Trova tutti i file supportati nella cartella
+            supported_extensions = ['.csv', '.txt', '.xlsx', '.sas7bdat']
+            files_found = []
+
+            for file in os.listdir(folder_path):
+                if any(file.lower().endswith(ext) for ext in supported_extensions):
+                    files_found.append(file)
+
+            # Mostra i file trovati
+            if files_found:
+                self.files_list_widget.setPlainText("\n".join(files_found))
+                self.wizard().claims_files_loaded = files_found
+
+                # Analizza il primo file per ottenere le colonne
+                first_file = os.path.join(folder_path, files_found[0])
+                try:
+                    columns = self.get_file_columns(first_file)
+                    self.column_names = columns
+                    self.wizard().claims_columns = columns
+
+                    self.file_info_label.setText(
+                        f"Trovati {len(files_found)} file.\n"
+                        f"Colonne nel primo file: {', '.join(columns[:5])}..."
+                    )
+                except Exception as e:
+                    self.file_info_label.setText(f"Errore nella lettura dei file: {str(e)}")
+            else:
+                self.files_list_widget.setPlainText("Nessun file supportato trovato nella cartella.")
+                self.file_info_label.setText("")
+
+            self.completeChanged.emit()
+
+    def get_file_columns(self, file_path):
+        """Ottiene le colonne da un file"""
+        if file_path.lower().endswith('.sas7bdat'):
+            df, meta = pyreadstat.read_sas7bdat(file_path, metadataonly=True)
+            return [self.normalize_column_name(col) for col in meta.column_names]
+        elif file_path.lower().endswith(('.csv', '.txt')):
+            # Prova prima con ;
+            try:
+                df = pd.read_csv(file_path, nrows=1, sep=';')
+                if len(df.columns) > 1:
+                    return [self.normalize_column_name(col) for col in df.columns]
+            except:
+                pass
+            # Prova con ,
+            df = pd.read_csv(file_path, nrows=1, sep=',')
+            return [self.normalize_column_name(col) for col in df.columns]
+        elif file_path.lower().endswith('.xlsx'):
+            df = pd.read_excel(file_path, nrows=1)
+            return [self.normalize_column_name(col) for col in df.columns]
+        return []
+
+    def normalize_column_name(self, col_name):
+        """Normalizza il nome della colonna"""
+        # Converti in lowercase
+        normalized = col_name.lower()
+        # Sostituisci underscore con spazi
+        normalized = normalized.replace('_', ' ')
+        # Rimuovi spazi extra
+        normalized = ' '.join(normalized.split())
+        return normalized
+
+    def isComplete(self):
+        return bool(self._claims_path) and os.path.exists(self._claims_path)
+
+
+class DatabaseExpositionPage(QWizardPage):
+    def __init__(self):
+        super().__init__()
+
+        self.setTitle("Selezione Cartella Database Riserve")
+        self.setSubTitle("Seleziona la cartella contenente i file delle riserve")
+
+        self.registerField("exposition_path*", self, "expositionPath", "expositionPathChanged")
+        self._exposition_path = ""
+        self.column_names = []
+        self.files_info = []
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            "<p>Il <b>Database Riserve</b> deve contenere le seguenti colonne:</p>"
+            "<ul>"
+            "<li><b>Periodo di osservazione</b>: Anno di periodo</li>"
+            "<li><b>Antidurata arrotondata</b>: Antidurata (1,2,3,4,5,6,7,8,9,10-15,15-20+)</li>"
+            "<li><b>Riserva</b>: Importo della riserva</li>"
+            "</ul>"
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        file_frame = QFrame()
+        file_layout = QHBoxLayout(file_frame)
+
+        self.folder_path_label = QLineEdit()
+        self.folder_path_label.setReadOnly(True)
+        self.folder_path_label.setPlaceholderText("Nessuna cartella selezionata")
+        file_layout.addWidget(self.folder_path_label, 1)
+
+        browse_button = QPushButton("Sfoglia...")
+        browse_button.clicked.connect(self.browse_folder)
+        file_layout.addWidget(browse_button)
+
+        layout.addWidget(file_frame)
+
+        # Lista file trovati
+        self.files_list_widget = QTextEdit()
+        self.files_list_widget.setReadOnly(True)
+        self.files_list_widget.setMaximumHeight(150)
+        layout.addWidget(QLabel("File trovati:"))
+        layout.addWidget(self.files_list_widget)
+
+        self.file_info_label = QLabel("")
+        layout.addWidget(self.file_info_label)
+
+        layout.addStretch()
+
+    def getExpositionPath(self):
+        return self._exposition_path
+
+    def setExpositionPath(self, path):
+        if self._exposition_path != path:
+            self._exposition_path = path
+            self.expositionPathChanged.emit()
+
+    expositionPath = property(getExpositionPath, setExpositionPath)
+    expositionPathChanged = Signal()
+
+    def browse_folder(self):
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Seleziona Cartella Database Riserve",
+            ""
+        )
+
+        if folder_path:
+            self.folder_path_label.setText(folder_path)
+            self._exposition_path = folder_path
+            self.setField("exposition_path", folder_path)
+
+            global DATABASE_EXPOSITION_PATH
+            DATABASE_EXPOSITION_PATH = folder_path
+
+            # Trova tutti i file supportati nella cartella
+            supported_extensions = ['.csv', '.txt', '.xlsx', '.sas7bdat']
+            files_found = []
+
+            for file in os.listdir(folder_path):
+                if any(file.lower().endswith(ext) for ext in supported_extensions):
+                    files_found.append(file)
+
+            # Mostra i file trovati
+            if files_found:
+                self.files_list_widget.setPlainText("\n".join(files_found))
+                self.wizard().exposition_files_loaded = files_found
+
+                # Analizza il primo file per ottenere le colonne
+                first_file = os.path.join(folder_path, files_found[0])
+                try:
+                    columns = self.get_file_columns(first_file)
+                    self.column_names = columns
+                    self.wizard().exposition_columns = columns
+
+                    self.file_info_label.setText(
+                        f"Trovati {len(files_found)} file.\n"
+                        f"Colonne nel primo file: {', '.join(columns[:5])}..."
+                    )
+                except Exception as e:
+                    self.file_info_label.setText(f"Errore nella lettura dei file: {str(e)}")
+            else:
+                self.files_list_widget.setPlainText("Nessun file supportato trovato nella cartella.")
+                self.file_info_label.setText("")
+
+            self.completeChanged.emit()
+
+    def get_file_columns(self, file_path):
+        """Ottiene le colonne da un file"""
+        if file_path.lower().endswith('.sas7bdat'):
+            df, meta = pyreadstat.read_sas7bdat(file_path, metadataonly=True)
+            return [self.normalize_column_name(col) for col in meta.column_names]
+        elif file_path.lower().endswith(('.csv', '.txt')):
+            # Prova prima con ;
+            try:
+                df = pd.read_csv(file_path, nrows=1, sep=';')
+                if len(df.columns) > 1:
+                    return [self.normalize_column_name(col) for col in df.columns]
+            except:
+                pass
+            # Prova con ,
+            df = pd.read_csv(file_path, nrows=1, sep=',')
+            return [self.normalize_column_name(col) for col in df.columns]
+        elif file_path.lower().endswith('.xlsx'):
+            df = pd.read_excel(file_path, nrows=1)
+            return [self.normalize_column_name(col) for col in df.columns]
+        return []
+
+    def normalize_column_name(self, col_name):
+        """Normalizza il nome della colonna"""
+        # Converti in lowercase
+        normalized = col_name.lower()
+        # Sostituisci underscore con spazi
+        normalized = normalized.replace('_', ' ')
+        # Rimuovi spazi extra
+        normalized = ' '.join(normalized.split())
+        return normalized
+
+    def isComplete(self):
+        return bool(self._exposition_path) and os.path.exists(self._exposition_path)
+
+
+class ClusterCreationPage(QWizardPage):
+    def __init__(self):
+        super().__init__()
+
+        self.setTitle("Creazione Colonna Cluster")
+        self.setSubTitle("Crea una colonna cluster combinando le colonne comuni")
+
+        self.cluster_configuration = None
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            "La colonna cluster verrà creata come 'Cluster' combinando una o più colonne comuni tra i database.\n"
+            "Questo permetterà di raggruppare i dati per l'analisi dei tassi di riscatto."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Frame per mostrare le colonne comuni
+        self.common_columns_frame = QGroupBox("Colonne comuni trovate")
+        self.common_columns_layout = QVBoxLayout(self.common_columns_frame)
+
+        self.common_columns_label = QLabel("Caricamento in corso...")
+        self.common_columns_layout.addWidget(self.common_columns_label)
+
+        layout.addWidget(self.common_columns_frame)
+
+        # Frame per la configurazione del cluster
+        self.cluster_config_frame = QGroupBox("Configurazione Cluster")
+        self.cluster_config_layout = QVBoxLayout(self.cluster_config_frame)
+
+        self.cluster_config_label = QLabel("Nessuna configurazione")
+        self.cluster_config_layout.addWidget(self.cluster_config_label)
+
+        self.create_cluster_button = QPushButton("Configura Cluster")
+        self.create_cluster_button.clicked.connect(self.create_cluster)
+        self.cluster_config_layout.addWidget(self.create_cluster_button)
+
+        layout.addWidget(self.cluster_config_frame)
+
+        layout.addStretch()
+
+    def initializePage(self):
+        """Inizializza la pagina quando viene mostrata"""
+        # Trova le colonne comuni
+        common_columns = self.wizard().find_common_columns()
+
+        if common_columns:
+            columns_text = f"Trovate {len(common_columns)} colonne comuni:\n"
+            columns_text += ", ".join(common_columns[:10])
+            if len(common_columns) > 10:
+                columns_text += f" ... e altre {len(common_columns) - 10}"
+        else:
+            columns_text = "Nessuna colonna comune trovata tra i database!"
+            self.create_cluster_button.setEnabled(False)
+
+        self.common_columns_label.setText(columns_text)
+
+    def create_cluster(self):
+        """Apre il dialog per creare il cluster"""
+        common_columns = self.wizard().find_common_columns()
+
+        if not common_columns:
+            QMessageBox.warning(self, "Attenzione", "Nessuna colonna comune disponibile.")
+            return
+
+        dialog = CreateClusterDialog(common_columns, self)
+        if dialog.exec() == QDialog.Accepted:
+            # Salva solo le colonne nel cluster_configuration
+            selected = dialog.get_cluster_configuration()['columns']
+            self.cluster_configuration = {'columns': selected}
+            self.wizard().cluster_configuration = self.cluster_configuration
+
+            # Forziamo il nome fisso 'Cluster' in CLUSTER_COLUMN
+            global CLUSTER_COLUMN
+            CLUSTER_COLUMN = 'Cluster'
+
+            # Aggiorna la visualizzazione
+            config_text = f"Colonne usate per 'Cluster':\n"
+            config_text += ", ".join(self.cluster_configuration['columns'])
+            self.cluster_config_label.setText(config_text)
+            self.cluster_config_label.setStyleSheet("color: green; font-weight: bold;")
+
+            self.completeChanged.emit()
+
+    def isComplete(self):
+        return self.cluster_configuration is not None
+
+
+class OutputFolderPage(QWizardPage):
+    def __init__(self):
+        super().__init__()
+
+        self.setTitle("Selezione Cartella di Output")
+        self.setSubTitle("Seleziona dove salvare i risultati dell'analisi")
+
+        self.registerField("output_path*", self, "outputPath", "outputPathChanged")
+        self._output_path = ""
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel("Seleziona una cartella dove salvare i risultati dell'analisi.")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        file_frame = QFrame()
+        file_layout = QHBoxLayout(file_frame)
+
+        self.file_path_label = QLineEdit()
+        self.file_path_label.setReadOnly(True)
+        self.file_path_label.setPlaceholderText("Nessuna cartella selezionata")
+        file_layout.addWidget(self.file_path_label, 1)
+
+        browse_button = QPushButton("Sfoglia...")
+        browse_button.clicked.connect(self.browse_folder)
+        file_layout.addWidget(browse_button)
+
+        layout.addWidget(file_frame)
+
+        self.file_info_label = QLabel("")
+        layout.addWidget(self.file_info_label)
+
+        layout.addStretch()
+
+        self.warning_label = QLabel()
+        self.warning_label.setStyleSheet("color: red;")
+        layout.addWidget(self.warning_label)
+
+    def getOutputPath(self):
+        return self._output_path
+
+    def setOutputPath(self, path):
+        if self._output_path != path:
+            self._output_path = path
+            self.outputPathChanged.emit()
+
+    outputPath = property(getOutputPath, setOutputPath)
+    outputPathChanged = Signal()
+
+    def browse_folder(self):
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Seleziona Cartella di Output",
+            ""
+        )
+
+        if folder_path:
+            self.file_path_label.setText(folder_path)
+            self._output_path = folder_path
+            self.setField("output_path", folder_path)
+
+            global OUTPUT_PATH
+            OUTPUT_PATH = folder_path
+
+            if os.access(folder_path, os.W_OK):
+                self.warning_label.setText("")
+                self.file_info_label.setText(f"Cartella selezionata: {folder_path}\nLa cartella è scrivibile.")
+            else:
+                self.warning_label.setText("Attenzione: La cartella selezionata non è scrivibile!")
+                self.file_info_label.setText(f"Cartella selezionata: {folder_path}")
+
+            self.completeChanged.emit()
+
+    def isComplete(self):
+        return bool(self._output_path) and os.access(self._output_path, os.W_OK)
+
+
+class DiagonalLapseRatesView(QDialog):
+    """Visualizzazione dei tassi di riscatto con dettagli totali, definitivi e reworkati"""
+
+    def __init__(self, lapse_rates_data, config, parent=None):
+        super().__init__(parent)
+
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinimizeButtonHint |
+                            Qt.WindowMaximizeButtonHint | Qt.WindowSystemMenuHint)
+
+        self.lapse_rates_data = lapse_rates_data
+        self.config = config
+        self.diagonal_data = {
+            'totali': {},
+            'definitivi': {},
+            'reworkati': {}
+        }
+        self.current_cluster = None
+
+        # Ordine corretto delle antidurate
+        self.antidurata_order = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10-15', '15-20+']
+
+        self.setWindowTitle("Visualizzazione Tassi di Riscatto")
+        self.setMinimumSize(1400, 900)
+
+        self.init_ui()
+        self.calculate_all_diagonal_data()
+        self.populate_diagonal_view()
+
+    def init_ui(self):
+        """Inizializza l'interfaccia utente"""
+        main_layout = QVBoxLayout(self)
+
+        # Header
+        header_label = QLabel("Visualizzazione Tassi di Riscatto")
+        header_label.setStyleSheet(
+            f"background-color: {BLU_PETROLIO}; color: {BIANCO}; padding: 15px; font-size: 18px; font-weight: bold;")
+        main_layout.addWidget(header_label)
+
+        # Controlli di navigazione
+        nav_frame = QWidget()
+        nav_layout = QHBoxLayout(nav_frame)
+        nav_frame.setStyleSheet(f"background-color: {GRIGIO_CHIARO}; padding: 10px;")
+
+        nav_layout.addStretch()
+
+        # Pulsanti azioni
+        self.toggle_params_button = QPushButton("Mostra/Nascondi Parametri")
+        self.toggle_params_button.clicked.connect(self.toggle_params)
+        nav_layout.addWidget(self.toggle_params_button)
+
+        self.save_button = QPushButton("Salva Risultati")
+        self.save_button.setStyleSheet(f"background-color: {VERDE_CHIARO}; color: {BIANCO}; font-weight: bold;")
+        self.save_button.clicked.connect(self.save_results)
+        nav_layout.addWidget(self.save_button)
+
+        self.close_button = QPushButton("Chiudi")
+        self.close_button.clicked.connect(self.accept)
+        nav_layout.addWidget(self.close_button)
+
+        main_layout.addWidget(nav_frame)
+
+        # Splitter principale
+        self.main_splitter = QSplitter(Qt.Horizontal)
+
+        # Pannello sinistro (parametri e filtri)
+        self.left_panel = QWidget()
+        self.left_layout = QVBoxLayout(self.left_panel)
+
+        # Informazioni di configurazione
+        config_group = QGroupBox("Configurazione")
+        config_group.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO};")
+        config_layout = QVBoxLayout(config_group)
+
+        config_text = (
+            f"<b>Anno di valutazione:</b> {self.config['last_year']}<br>"
+            f"<b>Anni di osservazione:</b> {self.config['obs_years']}<br>"
+            f"<b>Base di calcolo:</b> {'Importi' if self.config['use_amounts'] else 'Numero pezzi'}<br>"
+        )
+        config_label = QLabel(config_text)
+        config_label.setTextFormat(Qt.RichText)
+        config_layout.addWidget(config_label)
+
+        weights_text = "<b>Distribuzione pesi:</b><br>"
+        for i, w in enumerate(self.config['weights'][:self.config['obs_years']]):
+            year = self.config['last_year'] - i
+            weights_text += f"Anno {year}: {w:.1f}%<br>"
+
+        weights_label = QLabel(weights_text)
+        weights_label.setTextFormat(Qt.RichText)
+        config_layout.addWidget(weights_label)
+
+        self.left_layout.addWidget(config_group)
+
+        # Pulsante Summary
+        summary_button_frame = QWidget()
+        summary_button_layout = QVBoxLayout(summary_button_frame)
+        summary_button_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.summary_button = QPushButton("Summary")
+        self.summary_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {VERDE_SCURO};
+                color: {BIANCO};
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: {VERDE_CHIARO};
+            }}
+        """)
+        self.summary_button.clicked.connect(self.show_summary)
+        summary_button_layout.addWidget(self.summary_button)
+
+        self.left_layout.addWidget(summary_button_frame)
+
+        # Selezione cluster
+        cluster_group = QGroupBox("Selezione Cluster")
+        cluster_group.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO};")
+        cluster_layout = QVBoxLayout(cluster_group)
+
+        search_frame = QFrame()
+        search_layout = QHBoxLayout(search_frame)
+        search_layout.setContentsMargins(0, 0, 0, 10)
+
+        search_layout.addWidget(QLabel("Cerca:"))
+        self.cluster_search_field = QLineEdit()
+        self.cluster_search_field.setPlaceholderText("Filtra i cluster...")
+        self.cluster_search_field.textChanged.connect(self.filter_clusters)
+        search_layout.addWidget(self.cluster_search_field)
+
+        cluster_layout.addWidget(search_frame)
+
+        self.cluster_list = QListWidget()
+        self.cluster_list.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        # Ottieni i cluster disponibili
+        available_clusters = self.get_available_clusters()
+
+        for cluster_info in available_clusters:
+            item = QListWidgetItem(str(cluster_info))
+            item.setData(Qt.UserRole, cluster_info)
+            self.cluster_list.addItem(item)
+
+        self.cluster_list.itemClicked.connect(self.on_cluster_clicked)
+
+        cluster_layout.addWidget(self.cluster_list)
+        self.left_layout.addWidget(cluster_group)
+
+        # Controlli per l'esportazione
+        export_group = QGroupBox("Esportazione")
+        export_group.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO};")
+        export_layout = QVBoxLayout(export_group)
+
+        self.export_excel_btn = QPushButton("Esporta in Excel")
+        self.export_excel_btn.setStyleSheet(f"background-color: {VERDE_SCURO}; color: {BIANCO};")
+        self.export_excel_btn.clicked.connect(self.export_to_excel)
+        export_layout.addWidget(self.export_excel_btn)
+
+        self.left_layout.addWidget(export_group)
+
+        self.main_splitter.addWidget(self.left_panel)
+
+        # Pannello destro (contenuto principale)
+        self.right_panel = QWidget()
+        self.right_layout = QVBoxLayout(self.right_panel)
+
+        # Scroll area per il contenuto
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setFrameShape(QFrame.NoFrame)
+
+        self.right_layout.addWidget(self.content_scroll)
+
+        self.main_splitter.addWidget(self.right_panel)
+        self.main_splitter.setSizes([300, 1100])
+
+        main_layout.addWidget(self.main_splitter)
+
+    def show_summary(self):
+        """Mostra la vista summary"""
+        self.current_cluster = None
+        self.cluster_list.clearSelection()
+        self.populate_diagonal_view()
+
+    def filter_clusters(self, text):
+        """Filtra l'elenco dei cluster"""
+        for i in range(self.cluster_list.count()):
+            item = self.cluster_list.item(i)
+            item.setHidden(text.lower() not in item.text().lower())
+
+    def toggle_params(self):
+        """Mostra/nasconde il pannello dei parametri"""
+        if self.left_panel.isVisible():
+            self.left_panel.hide()
+            self.toggle_params_button.setText("Mostra Parametri")
+        else:
+            self.left_panel.show()
+            self.toggle_params_button.setText("Nascondi Parametri")
+
+    def get_available_clusters(self):
+        """Ottiene i cluster disponibili dai dati"""
+        if 'totali' in self.lapse_rates_data and 'lapse_rates_avg' in self.lapse_rates_data['totali']:
+            unique_clusters = self.lapse_rates_data['totali']['lapse_rates_avg']['Cluster'].dropna().unique()
+            return sorted([str(x) for x in unique_clusters])
+        return []
+
+    def calculate_all_diagonal_data(self):
+        """Calcola i dati diagonali per tutti e 3 i tipi"""
+        for tipo in ['totali', 'definitivi', 'reworkati']:
+            self.calculate_diagonal_data_for_type(tipo)
+
+    def calculate_diagonal_data_for_type(self, tipo):
+        """Calcola i dati diagonali per un tipo specifico"""
+        print(f"Calcolo dati diagonali per {tipo}...")
+
+        if tipo not in self.lapse_rates_data:
+            return
+
+        data = self.lapse_rates_data[tipo]
+
+        for cluster in self.get_available_clusters():
+            self.diagonal_data[tipo][cluster] = {}
+
+            if 'lapse_rates_by_year' not in data:
+                continue
+
+            cluster_data = data['lapse_rates_by_year'][
+                data['lapse_rates_by_year']['Cluster'] == cluster
+                ]
+
+            if cluster_data.empty:
+                continue
+
+            # Ordina i dati
+            cluster_data = cluster_data.sort_values(
+                ['Investigation_Year_(end)', 'Antidurate_Grouped'],
+                ascending=[False, True]
+            )
+
+            # Raggruppa per antidurata
+            grouped_data = cluster_data.groupby(['Investigation_Year_(end)', 'Antidurate_Grouped']).agg({
+                'Cluster': 'first',
+                'Lapse_Rate': 'first',
+                'Claims_Value': 'sum',
+                'Exposure_Value': 'sum'
+            }).reset_index()
+
+            # Pivot per avere una matrice
+            lapse_matrix = grouped_data.pivot(
+                index='Investigation_Year_(end)',
+                columns='Antidurate_Grouped',
+                values='Lapse_Rate'
+            ).fillna(np.nan)
+
+            # Assicurati che tutte le colonne esistano nella matrice
+            for ant in self.antidurata_order:
+                if ant not in lapse_matrix.columns:
+                    lapse_matrix[ant] = np.nan
+
+            # Riordina le colonne nell'ordine corretto
+            lapse_matrix = lapse_matrix.reindex(columns=self.antidurata_order)
+
+            # Calcola la media ponderata per ogni antidurata
+            observation_years = sorted(lapse_matrix.index, reverse=True)
+            years_to_use = min(len(observation_years), self.config['obs_years'])
+
+            weights = self.config['weights'][:years_to_use]
+            normalized_weights = [w / 100.0 for w in weights]
+
+            for antidurata in self.antidurata_order:
+                weighted_sum = 0
+                total_weight = 0
+
+                for idx, year in enumerate(observation_years[:years_to_use]):
+                    if year in lapse_matrix.index:
+                        rate = lapse_matrix.loc[year, antidurata]
+
+                        if pd.notna(rate):
+                            weight = normalized_weights[idx] if idx < len(normalized_weights) else 0
+                            weighted_sum += rate * weight
+                            total_weight += weight
+
+                if total_weight > 0:
+                    self.diagonal_data[tipo][cluster][antidurata] = weighted_sum / total_weight
+                else:
+                    self.diagonal_data[tipo][cluster][antidurata] = np.nan
+
+            self.diagonal_data[tipo][cluster]['matrix'] = lapse_matrix
+
+    def populate_diagonal_view(self):
+        """Popola la vista corrente"""
+        # Crea un nuovo container per il contenuto
+        new_container = QWidget()
+        new_layout = QVBoxLayout(new_container)
+
+        # Se c'è un cluster selezionato, mostra i dati del cluster
+        selected_items = self.cluster_list.selectedItems()
+        if selected_items:
+            cluster_info = selected_items[0].data(Qt.UserRole)
+            self.current_cluster = cluster_info
+            self.update_content_for_cluster(cluster_info, new_layout)
+        else:
+            # Altrimenti mostra il summary
+            self.current_cluster = None
+            self.show_all_clusters_summary(new_layout)
+
+        # Imposta il nuovo container nell'area di scroll
+        self.content_scroll.setWidget(new_container)
+
+        # Scrolla all'inizio
+        QTimer.singleShot(0, lambda: self.content_scroll.verticalScrollBar().setValue(0))
+
+    def on_cluster_clicked(self, item):
+        """Gestisce il click su un cluster"""
+        if item:
+            cluster_info = item.data(Qt.UserRole)
+            self.current_cluster = cluster_info
+            self.populate_diagonal_view()
+
+    def update_content_for_cluster(self, cluster_info, layout):
+        """Aggiorna il contenuto per un cluster specifico"""
+        # Titolo della categoria
+        title_label = QLabel(f"Tassi di riscatto - Cluster: {cluster_info}")
+        title_label.setStyleSheet(f"font-weight: bold; color: {VERDE_SCURO}; font-size: 18px; margin: 20px 0;")
+        layout.addWidget(title_label)
+
+        # Per ogni tipo di dato
+        for tipo_idx, (tipo, tipo_label) in enumerate([
+            ('totali', 'Tassi di riscatto totali'),
+            ('definitivi', 'Tassi per riscatti definitivi'),
+            ('reworkati', 'Tassi per riscatti reworked')
+        ]):
+
+            if tipo_idx > 0:
+                # Separatore
+                separator = QFrame()
+                separator.setFrameShape(QFrame.HLine)
+                separator.setFrameShadow(QFrame.Sunken)
+                separator.setStyleSheet("margin: 30px 0;")
+                layout.addWidget(separator)
+
+            # Sottotitolo per il tipo
+            subtitle = QLabel(tipo_label)
+            subtitle.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO}; font-size: 16px; margin-top: 20px;")
+            layout.addWidget(subtitle)
+
+            if cluster_info not in self.diagonal_data[tipo]:
+                label = QLabel(f"Nessun dato disponibile")
+                label.setStyleSheet("color: red; font-weight: bold;")
+                layout.addWidget(label)
+                continue
+
+            cluster_data = self.diagonal_data[tipo][cluster_info]
+
+            # Sezione 1: Tassi medi per antidurata (con scroll orizzontale)
+            section1_title = QLabel("Tassi medi per antidurata")
+            section1_title.setStyleSheet(
+                f"font-weight: bold; color: {BLU_PETROLIO}; font-size: 14px; margin-top: 10px;")
+            layout.addWidget(section1_title)
+
+            # Scroll area per la tabella
+            table_scroll = QScrollArea()
+            table_scroll.setWidgetResizable(True)
+            table_scroll.setMaximumHeight(150)
+            table_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            table_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+            # Contenitore per la tabella
+            diagonal_container = QWidget()
+            diagonal_frame = QFrame(diagonal_container)
+            diagonal_frame.setFrameStyle(QFrame.Box)
+            diagonal_layout = QGridLayout(diagonal_frame)
+
+            diagonal_layout.addWidget(QLabel("Antidurata", styleSheet="font-weight: bold;"), 0, 0)
+            diagonal_layout.addWidget(QLabel("Tasso Medio", styleSheet="font-weight: bold;"), 1, 0)
+
+            for i, antidurata in enumerate(self.antidurata_order):
+                header = QLabel(antidurata)
+                header.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO};")
+                header.setMinimumWidth(80)
+                diagonal_layout.addWidget(header, 0, i + 1)
+
+                if antidurata in cluster_data:
+                    value = cluster_data[antidurata]
+                    if pd.notna(value):
+                        value_label = QLabel(f"{value:.2%}")
+                        intensity = min(1.0, value * 2)
+                        color = f"rgba(255, {int(255 * (1 - intensity))}, {int(255 * (1 - intensity))}, 1.0)"
+                        value_label.setStyleSheet(f"background-color: {color}; font-weight: bold; padding: 5px;")
+                    else:
+                        value_label = QLabel("-")
+                        value_label.setStyleSheet("padding: 5px;")
+                else:
+                    value_label = QLabel("-")
+                    value_label.setStyleSheet("padding: 5px;")
+
+                value_label.setMinimumWidth(80)
+                diagonal_layout.addWidget(value_label, 1, i + 1)
+
+            # Imposta la larghezza del contenitore
+            diagonal_container.setLayout(QHBoxLayout())
+            diagonal_container.layout().addWidget(diagonal_frame)
+            diagonal_container.layout().addStretch()
+
+            table_scroll.setWidget(diagonal_container)
+            layout.addWidget(table_scroll)
+
+            # Sezione 2: Dettaglio tassi per anno e antidurata (matrice)
+            if 'matrix' in cluster_data:
+                section2_title = QLabel("Dettaglio tassi per anno e antidurata")
+                section2_title.setStyleSheet(
+                    f"font-weight: bold; color: {BLU_PETROLIO}; font-size: 14px; margin-top: 20px;")
+                layout.addWidget(section2_title)
+
+                # Scroll area per la matrice
+                matrix_scroll = QScrollArea()
+                matrix_scroll.setWidgetResizable(True)
+                matrix_scroll.setMaximumHeight(200)
+                matrix_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                matrix_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+                matrix_container = QWidget()
+                matrix = cluster_data['matrix']
+                matrix_frame = QFrame(matrix_container)
+                matrix_frame.setFrameStyle(QFrame.Box)
+                matrix_layout = QGridLayout(matrix_frame)
+
+                observation_years = sorted(matrix.index, reverse=True)[:self.config['obs_years']]
+
+                matrix_layout.addWidget(QLabel("Anno", styleSheet="font-weight: bold;"), 0, 0)
+
+                col_idx = 1
+                for antidurata in self.antidurata_order:
+                    if antidurata in matrix.columns:
+                        header = QLabel(antidurata)
+                        header.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO};")
+                        header.setMinimumWidth(80)
+                        matrix_layout.addWidget(header, 0, col_idx)
+                        col_idx += 1
+
+                for row, year in enumerate(observation_years):
+                    year_label = QLabel(str(int(year)))
+                    year_label.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO};")
+                    matrix_layout.addWidget(year_label, row + 1, 0)
+
+                    col_idx = 1
+                    for antidurata in self.antidurata_order:
+                        if antidurata in matrix.columns and year in matrix.index:
+                            value = matrix.loc[year, antidurata]
+
+                            if pd.notna(value):
+                                value_label = QLabel(f"{value:.2%}")
+                                intensity = min(1.0, value * 2)
+                                color = f"rgba(255, {int(255 * (1 - intensity))}, {int(255 * (1 - intensity))}, 1.0)"
+                                value_label.setStyleSheet(f"background-color: {color}; padding: 5px;")
+                            else:
+                                value_label = QLabel("-")
+                                value_label.setStyleSheet("padding: 5px;")
+
+                            value_label.setMinimumWidth(80)
+                            matrix_layout.addWidget(value_label, row + 1, col_idx)
+                            col_idx += 1
+
+                matrix_container.setLayout(QHBoxLayout())
+                matrix_container.layout().addWidget(matrix_frame)
+                matrix_container.layout().addStretch()
+
+                matrix_scroll.setWidget(matrix_container)
+                layout.addWidget(matrix_scroll)
+
+            # Sezione 3: Grafico
+            chart_fig = Figure(figsize=(12, 6), dpi=100)
+            chart_fig.patch.set_facecolor(BIANCO)
+            chart_canvas = FigureCanvas(chart_fig)
+
+            ax = chart_fig.add_subplot(111)
+
+            x_labels = []
+            y_values = []
+
+            for antidurata in self.antidurata_order:
+                if antidurata in cluster_data and pd.notna(cluster_data[antidurata]):
+                    x_labels.append(antidurata)
+                    y_values.append(cluster_data[antidurata])
+
+            if x_labels and y_values:
+                x = np.arange(len(x_labels))
+                y = np.array(y_values)
+
+                # Grafico a barre strette per 11 valori
+                bars = ax.bar(x, y, color=VERDE_SCURO, width=0.5)
+
+                # Etichette sui valori
+                for bar, value in zip(bars, y):
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width() / 2., height,
+                            f'{value:.2%}',
+                            ha='center', va='bottom', fontsize=8)
+
+                ax.set_xticks(x)
+                ax.set_xticklabels(x_labels, rotation=0)
+                ax.set_title(f"{tipo_label} - {cluster_info}")
+                ax.set_xlabel("Antidurata")
+                ax.set_ylabel("Tasso di Riscatto")
+                ax.grid(True, alpha=0.3, axis='y')
+
+                # Formatta l'asse y come percentuale
+                ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
+
+                # Imposta limiti Y appropriati
+                y_max = max(y) * 1.2 if len(y) > 0 else 0.1
+                ax.set_ylim(0, y_max)
+            else:
+                ax.text(0.5, 0.5, "Dati insufficienti per il grafico",
+                        ha='center', va='center', transform=ax.transAxes,
+                        fontsize=14, color='red')
+
+            chart_fig.tight_layout()
+            chart_canvas.draw()
+            layout.addWidget(chart_canvas)
+
+        # Aggiungi spazio alla fine
+        layout.addStretch()
+
+    def show_all_clusters_summary(self, layout):
+        """Mostra un riassunto di tutti i cluster con il nuovo layout"""
+        # Titolo
+        title_label = QLabel("Tassi di riscatto - Tutti i Cluster")
+        title_label.setStyleSheet(f"font-weight: bold; color: {VERDE_SCURO}; font-size: 18px; margin: 20px 0;")
+        layout.addWidget(title_label)
+
+        info_label = QLabel("Seleziona un cluster dalla lista a sinistra per visualizzare i dettagli.")
+        info_label.setStyleSheet("font-style: italic; color: #777;")
+        layout.addWidget(info_label)
+
+        # Calcola i vettori medi complessivi
+        avg_data = self.calculate_overall_averages()
+
+        # Sezione 1: Vettori medi
+        vectors_title = QLabel("Vettori medi complessivi")
+        vectors_title.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO}; font-size: 16px; margin-top: 20px;")
+        layout.addWidget(vectors_title)
+
+        # Tabella vettori medi
+        vectors_frame = QFrame()
+        vectors_frame.setFrameStyle(QFrame.Box)
+        vectors_layout = QGridLayout(vectors_frame)
+
+        # Headers
+        vectors_layout.addWidget(QLabel("Tipo", styleSheet="font-weight: bold;"), 0, 0)
+        for i, antidurata in enumerate(self.antidurata_order):
+            header = QLabel(antidurata)
+            header.setStyleSheet("font-weight: bold;")
+            header.setMinimumWidth(70)
+            vectors_layout.addWidget(header, 0, i + 1)
+
+        # Dati
+        row_configs = [
+            ("Totali", avg_data['totali'], "black"),
+            ("Uscite definitive", avg_data['definitivi'], "red"),
+            ("Riscatti reworked", avg_data['reworkati'], f"rgb(0, 200, 0)")
+        ]
+
+        for row, (label, data, color) in enumerate(row_configs, 1):
+            label_widget = QLabel(label)
+            label_widget.setStyleSheet(f"font-weight: bold; color: {color};")
+            vectors_layout.addWidget(label_widget, row, 0)
+
+            for i, antidurata in enumerate(self.antidurata_order):
+                if antidurata in data and pd.notna(data[antidurata]):
+                    value_label = QLabel(f"{data[antidurata]:.2%}")
+                    value_label.setStyleSheet(f"color: {color};")
+                else:
+                    value_label = QLabel("-")
+
+                value_label.setMinimumWidth(70)
+                vectors_layout.addWidget(value_label, row, i + 1)
+
+        # Metti la tabella in uno scroll orizzontale
+        table_scroll = QScrollArea()
+        table_scroll.setWidgetResizable(True)
+        table_scroll.setWidget(vectors_frame)
+        table_scroll.setMaximumHeight(150)
+        table_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        table_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        layout.addWidget(table_scroll)
+
+        # Sezione 2: Grafico composizione
+        composition_title = QLabel("Composizione dei tassi di riscatto")
+        composition_title.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO}; font-size: 16px; margin-top: 30px;")
+        layout.addWidget(composition_title)
+
+        # Grafico a barre orizzontali impilate
+        chart_fig = Figure(figsize=(10, 8), dpi=100)
+        chart_fig.patch.set_facecolor(BIANCO)
+        chart_canvas = FigureCanvas(chart_fig)
+
+        ax = chart_fig.add_subplot(111)
+
+        # Prepara i dati per il grafico
+        categories = []
+        definitivi_pct = []
+        reworkati_pct = []
+
+        for antidurata in self.antidurata_order:
+            if (antidurata in avg_data['totali'] and pd.notna(avg_data['totali'][antidurata]) and
+                    avg_data['totali'][antidurata] > 0):
+                categories.append(antidurata)
+
+                # Calcola le percentuali relative
+                total = avg_data['totali'][antidurata]
+                def_val = avg_data['definitivi'].get(antidurata, 0) if pd.notna(
+                    avg_data['definitivi'].get(antidurata)) else 0
+                rew_val = avg_data['reworkati'].get(antidurata, 0) if pd.notna(
+                    avg_data['reworkati'].get(antidurata)) else 0
+
+                # Normalizza al 100%
+                def_pct = (def_val / total) * 100 if total > 0 else 0
+                rew_pct = (rew_val / total) * 100 if total > 0 else 0
+
+                definitivi_pct.append(def_pct)
+                reworkati_pct.append(rew_pct)
+
+        if categories:
+            y_pos = np.arange(len(categories))
+
+            # Crea le barre impilate
+            bars1 = ax.barh(y_pos, definitivi_pct, color='red', label='Uscite definitive')
+            bars2 = ax.barh(y_pos, reworkati_pct, left=definitivi_pct, color='#00C800', label='Riscatti reworked')
+
+            # Aggiungi le etichette percentuali
+            for i, (bar1, bar2) in enumerate(zip(bars1, bars2)):
+                # Etichetta per definitivi
+                if definitivi_pct[i] > 5:  # Mostra solo se > 5%
+                    ax.text(definitivi_pct[i] / 2, i, f'{definitivi_pct[i]:.1f}%',
+                            ha='center', va='center', color='white', fontweight='bold')
+
+                # Etichetta per reworkati
+                if reworkati_pct[i] > 5:  # Mostra solo se > 5%
+                    ax.text(definitivi_pct[i] + reworkati_pct[i] / 2, i, f'{reworkati_pct[i]:.1f}%',
+                            ha='center', va='center', color='white', fontweight='bold')
+
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(categories)
+            ax.set_xlabel('Percentuale (%)')
+            ax.set_xlim(0, 100)
+            ax.set_title('Composizione dei tassi di riscatto per antidurata')
+            ax.legend(loc='lower right')
+            ax.grid(True, alpha=0.3, axis='x')
+
+        else:
+            ax.text(0.5, 0.5, "Dati insufficienti per il grafico",
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=14, color='red')
+
+        chart_fig.tight_layout()
+        chart_canvas.draw()
+        layout.addWidget(chart_canvas)
+
+        # Sezione 3: Tabella dettaglio per cluster (compatta)
+        detail_title = QLabel("Dettaglio per cluster")
+        detail_title.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO}; font-size: 16px; margin-top: 30px;")
+        layout.addWidget(detail_title)
+
+        # Lista cluster scrollabile
+        cluster_scroll = QScrollArea()
+        cluster_scroll.setMaximumHeight(400)
+        cluster_container = QWidget()
+        cluster_layout = QVBoxLayout(cluster_container)
+
+        for cluster in self.get_available_clusters():
+            # Frame per ogni cluster
+            cluster_frame = QFrame()
+            cluster_frame.setFrameStyle(QFrame.Box)
+            cluster_frame_layout = QVBoxLayout(cluster_frame)
+
+            # Nome cluster
+            cluster_label = QLabel(f"Cluster: {cluster}")
+            cluster_label.setStyleSheet(f"font-weight: bold; color: {VERDE_SCURO};")
+            cluster_frame_layout.addWidget(cluster_label)
+
+            # Mini tabella con solo i valori totali
+            mini_table = QWidget()
+            mini_layout = QGridLayout(mini_table)
+
+            for i, antidurata in enumerate(self.antidurata_order):
+                mini_layout.addWidget(QLabel(antidurata, styleSheet="font-size: 10px;"), 0, i)
+
+                if cluster in self.diagonal_data['totali'] and antidurata in self.diagonal_data['totali'][cluster]:
+                    value = self.diagonal_data['totali'][cluster][antidurata]
+                    if pd.notna(value):
+                        val_label = QLabel(f"{value:.1%}")
+                        val_label.setStyleSheet("font-size: 10px;")
+                    else:
+                        val_label = QLabel("-")
+                        val_label.setStyleSheet("font-size: 10px;")
+                else:
+                    val_label = QLabel("-")
+                    val_label.setStyleSheet("font-size: 10px;")
+
+                mini_layout.addWidget(val_label, 1, i)
+
+            cluster_frame_layout.addWidget(mini_table)
+            cluster_layout.addWidget(cluster_frame)
+
+        cluster_scroll.setWidget(cluster_container)
+        layout.addWidget(cluster_scroll)
+
+        layout.addStretch()
+
+    def calculate_overall_averages(self):
+        """Calcola le medie complessive di tutti i cluster"""
+        avg_data = {
+            'totali': {},
+            'definitivi': {},
+            'reworkati': {}
+        }
+
+        for tipo in ['totali', 'definitivi', 'reworkati']:
+            for antidurata in self.antidurata_order:
+                values = []
+
+                for cluster in self.get_available_clusters():
+                    if cluster in self.diagonal_data[tipo] and antidurata in self.diagonal_data[tipo][cluster]:
+                        value = self.diagonal_data[tipo][cluster][antidurata]
+                        if pd.notna(value):
+                            values.append(value)
+
+                if values:
+                    avg_data[tipo][antidurata] = np.mean(values)
+                else:
+                    avg_data[tipo][antidurata] = np.nan
+
+        return avg_data
+
+    def save_results(self):
+        """Salva i risultati"""
+        self.export_to_excel()
+
+    def export_to_excel(self):
+        """Esporta i dati in Excel"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salva dati",
+            os.path.join(OUTPUT_PATH if OUTPUT_PATH else "", 'Lapse_Rates_Complete.xlsx'),
+            "Excel Files (*.xlsx);;All Files (*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                # Configurazione
+                metadata_data = [
+                    ['Anno di valutazione', self.config['last_year']],
+                    ['Anni di osservazione', self.config['obs_years']],
+                    ['Distribuzione pesi', ", ".join([f"{w:.1f}%" for w in self.config['weights']])],
+                    ['Base di calcolo', 'Importi' if self.config['use_amounts'] else 'Numero pezzi'],
+                    ['Data elaborazione', datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')]
+                ]
+
+                metadata = pd.DataFrame(metadata_data, columns=['Parametro', 'Valore'])
+                metadata.to_excel(writer, sheet_name='Configurazione', index=False)
+
+                # Crea dataframe summary completo
+                summary_data = []
+                for cluster in self.get_available_clusters():
+                    row = {'Cluster': cluster}
+
+                    for antidurata in self.antidurata_order:
+                        # Totali
+                        if cluster in self.diagonal_data['totali'] and antidurata in self.diagonal_data['totali'][
+                            cluster]:
+                            row[f"{antidurata}_Totali"] = self.diagonal_data['totali'][cluster][antidurata]
+                        else:
+                            row[f"{antidurata}_Totali"] = np.nan
+
+                        # Definitivi
+                        if cluster in self.diagonal_data['definitivi'] and antidurata in \
+                                self.diagonal_data['definitivi'][cluster]:
+                            row[f"{antidurata}_Definitivi"] = self.diagonal_data['definitivi'][cluster][antidurata]
+                        else:
+                            row[f"{antidurata}_Definitivi"] = np.nan
+
+                        # Reworkati
+                        if cluster in self.diagonal_data['reworkati'] and antidurata in self.diagonal_data['reworkati'][
+                            cluster]:
+                            row[f"{antidurata}_Reworkati"] = self.diagonal_data['reworkati'][cluster][antidurata]
+                        else:
+                            row[f"{antidurata}_Reworkati"] = np.nan
+
+                    summary_data.append(row)
+
+                if summary_data:
+                    summary_df = pd.DataFrame(summary_data)
+                    summary_df.to_excel(writer, sheet_name='Summary_Completo', index=False)
+
+                # Medie complessive
+                avg_data = self.calculate_overall_averages()
+                avg_rows = []
+                for tipo in ['totali', 'definitivi', 'reworkati']:
+                    row = {'Tipo': tipo}
+                    for antidurata in self.antidurata_order:
+                        row[antidurata] = avg_data[tipo].get(antidurata, np.nan)
+                    avg_rows.append(row)
+
+                avg_df = pd.DataFrame(avg_rows)
+                avg_df.to_excel(writer, sheet_name='Medie_Complessive', index=False)
+
+                # Per ogni tipo
+                for tipo in ['totali', 'definitivi', 'reworkati']:
+                    if tipo not in self.diagonal_data:
+                        continue
+
+                    # Dettagli per ogni cluster
+                    for cluster in self.get_available_clusters():
+                        if cluster in self.diagonal_data[tipo] and 'matrix' in self.diagonal_data[tipo][cluster]:
+                            sheet_name = f"{tipo.capitalize()}_{cluster}"[:31]
+                            matrix_df = self.diagonal_data[tipo][cluster]['matrix']
+                            matrix_df.to_excel(writer, sheet_name=sheet_name)
+
+            QMessageBox.information(self, "Esportazione Completata",
+                                    f"I dati sono stati esportati in {file_path}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Errore", f"Si è verificato un errore durante l'esportazione: {str(e)}")
+
+
+# Classe per la crittografia dei dati
+class EncryptionHandler:
+    def __init__(self, key_file='encryption_key.key'):
+        if OUTPUT_PATH:
+            key_file = os.path.join(OUTPUT_PATH, key_file)
+
+        self.key_file = key_file
+        if not os.path.exists(key_file):
+            self._generate_key()
+        else:
+            self._load_key()
+
+    def _generate_key(self):
+        """Genera una nuova chiave di crittografia e la salva"""
+        key = Fernet.generate_key()
+        with open(self.key_file, 'wb') as key_file:
+            key_file.write(key)
+        self.key = key
+        self.cipher = Fernet(key)
+
+    def _load_key(self):
+        """Carica una chiave esistente"""
+        with open(self.key_file, 'rb') as key_file:
+            self.key = key_file.read()
+        self.cipher = Fernet(self.key)
+
+    def encrypt_data(self, data):
+        """Cripta una stringa o un byte array"""
+        if isinstance(data, str):
+            return self.cipher.encrypt(data.encode()).decode()
+        elif isinstance(data, bytes):
+            return self.cipher.encrypt(data)
+        return data
+
+    def decrypt_data(self, encrypted_data):
+        """Decripta una stringa o un byte array"""
+        if isinstance(encrypted_data, str):
+            try:
+                return self.cipher.decrypt(encrypted_data.encode()).decode()
+            except:
+                return encrypted_data
+        elif isinstance(encrypted_data, bytes):
+            try:
+                return self.cipher.decrypt(encrypted_data)
+            except:
+                return encrypted_data
+        return encrypted_data
+
+    def encrypt_file(self, input_file, output_file=None):
+        """Cripta un file intero"""
+        if output_file is None:
+            output_file = input_file + '.enc'
+
+        with open(input_file, 'rb') as f:
+            data = f.read()
+
+        encrypted_data = self.encrypt_data(data)
+
+        with open(output_file, 'wb') as f:
+            f.write(encrypted_data)
+
+        return output_file
+
+    def decrypt_file(self, input_file, output_file=None):
+        """Decripta un file intero"""
+        if output_file is None:
+            output_file = input_file[:-4] if input_file.endswith('.enc') else input_file + '.dec'
+
+        with open(input_file, 'rb') as f:
+            data = f.read()
+
+        decrypted_data = self.decrypt_data(data)
+
+        with open(output_file, 'wb') as f:
+            f.write(decrypted_data)
+
+        return output_file
+
+
+# Modello per tabelle dati pandas
+class PandasTableModel(QAbstractTableModel):
+    def __init__(self, data, parent=None):
+        super().__init__(parent)
+        self._data = data
+
+    def rowCount(self, parent=None):
+        return len(self._data.index)
+
+    def columnCount(self, parent=None):
+        return len(self._data.columns)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+
+        if role == Qt.DisplayRole:
+            value = self._data.iloc[index.row(), index.column()]
+            if pd.isna(value):
+                return ""
+            elif isinstance(value, (float, np.float64, np.float32)):
+                return f"{value:.6g}"
+            elif isinstance(value, (int, np.int64, np.int32)):
+                return f"{value:d}"
+            else:
+                return str(value)
+
+        elif role == Qt.TextAlignmentRole:
+            value = self._data.iloc[index.row(), index.column()]
+            if isinstance(value, (int, float, np.number)):
+                return Qt.AlignRight | Qt.AlignVCenter
+            return Qt.AlignLeft | Qt.AlignVCenter
+
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole:
+            if orientation == Qt.Horizontal:
+                return str(self._data.columns[section])
+            if orientation == Qt.Vertical:
+                return str(self._data.index[section])
+        return None
+
+
+# Widget per il reindirizzamento dell'output a una TextEdit
+class OutputRedirector(QObject):
+    outputWritten = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.queue = queue.Queue()
+
+    def write(self, text):
+        self.queue.put(text)
+        self.outputWritten.emit(text)
+
+    def flush(self):
+        pass
+
+
+# Widget per la selezione multipla
+class MultiSelectionWidget(QWidget):
+    def __init__(self, title, items=None, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.items = items or []
+        self.selected_items = []
+
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+
+        title_label = QLabel(self.title)
+        title_label.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO}")
+        layout.addWidget(title_label)
+
+        lists_frame = QWidget()
+        lists_layout = QHBoxLayout(lists_frame)
+
+        # Lista elementi disponibili
+        available_layout = QVBoxLayout()
+        available_label = QLabel("Disponibili:")
+        available_layout.addWidget(available_label)
+
+        self.available_list = QListWidget()
+        self.available_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        available_layout.addWidget(self.available_list)
+
+        lists_layout.addLayout(available_layout)
+
+        # Pulsanti
+        buttons_layout = QVBoxLayout()
+        buttons_layout.addStretch()
+
+        self.add_button = QPushButton(">>")
+        self.add_button.clicked.connect(self.add_selected)
+        buttons_layout.addWidget(self.add_button)
+
+        self.remove_button = QPushButton("<<")
+        self.remove_button.clicked.connect(self.remove_selected)
+        buttons_layout.addWidget(self.remove_button)
+
+        self.add_all_button = QPushButton("Tutti >>")
+        self.add_all_button.clicked.connect(self.add_all)
+        buttons_layout.addWidget(self.add_all_button)
+
+        self.remove_all_button = QPushButton("<< Tutti")
+        self.remove_all_button.clicked.connect(self.remove_all)
+        buttons_layout.addWidget(self.remove_all_button)
+
+        buttons_layout.addStretch()
+        lists_layout.addLayout(buttons_layout)
+
+        # Lista elementi selezionati
+        selected_layout = QVBoxLayout()
+        selected_label = QLabel("Selezionati:")
+        selected_layout.addWidget(selected_label)
+
+        self.selected_list = QListWidget()
+        self.selected_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        selected_layout.addWidget(self.selected_list)
+
+        lists_layout.addLayout(selected_layout)
+
+        layout.addWidget(lists_frame)
+        self.setLayout(layout)
+
+        self.available_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.selected_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self.update_items(self.items)
+
+    def update_items(self, items):
+        """Aggiorna la lista di elementi disponibili"""
+        self.items = list(items)
+        self.refresh_lists()
+
+    def add_selected(self):
+        """Sposta gli elementi selezionati"""
+        selected_items = [self.available_list.item(i).text() for i in range(self.available_list.count())
+                          if self.available_list.item(i).isSelected()]
+
+        for item in selected_items:
+            if item not in self.selected_items:
+                self.selected_items.append(item)
+
+        self.refresh_lists()
+
+    def remove_selected(self):
+        """Rimuove gli elementi selezionati"""
+        selected_items = [self.selected_list.item(i).text() for i in range(self.selected_list.count())
+                          if self.selected_list.item(i).isSelected()]
+
+        for item in selected_items:
+            if item in self.selected_items:
+                self.selected_items.remove(item)
+
+        self.refresh_lists()
+
+    def add_all(self):
+        """Sposta tutti gli elementi"""
+        self.selected_items = list(self.items)
+        self.refresh_lists()
+
+    def remove_all(self):
+        """Rimuove tutti gli elementi"""
+        self.selected_items = []
+        self.refresh_lists()
+
+    def refresh_lists(self):
+        """Aggiorna il contenuto delle liste"""
+        available_items = [item for item in self.items if item not in self.selected_items]
+
+        self.available_list.clear()
+        self.available_list.addItems(available_items)
+
+        self.selected_list.clear()
+        self.selected_list.addItems(self.selected_items)
+
+    def get_selected_items(self):
+        """Restituisce la lista degli elementi selezionati"""
+        return self.selected_items
+
+
+# Widget collassabile
+class CollapsibleWidget(QWidget):
+    def __init__(self, title="", parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.is_expanded = True
+
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Header frame
+        self.header_frame = QFrame()
+        header_layout = QHBoxLayout(self.header_frame)
+
+        self.toggle_button = QPushButton("▼" if self.is_expanded else "▶")
+        self.toggle_button.setFixedWidth(30)
+        self.toggle_button.setStyleSheet(f"color: {VERDE_SCURO};")
+        self.toggle_button.clicked.connect(self.toggle)
+        header_layout.addWidget(self.toggle_button)
+
+        title_label = QLabel(self.title)
+        title_label.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO};")
+        header_layout.addWidget(title_label)
+        header_layout.addStretch()
+
+        # Separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+
+        # Content widget with scroll area
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.NoFrame)
+
+        self.content_widget = QWidget()
+        self.content_layout = QVBoxLayout(self.content_widget)
+        self.content_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.scroll_area.setWidget(self.content_widget)
+
+        layout.addWidget(self.header_frame)
+        layout.addWidget(separator)
+        layout.addWidget(self.scroll_area)
+
+        self.scroll_area.setVisible(self.is_expanded)
+
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.content_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def toggle(self):
+        self.is_expanded = not self.is_expanded
+        self.toggle_button.setText("▼" if self.is_expanded else "▶")
+        self.scroll_area.setVisible(self.is_expanded)
+
+    def get_content_layout(self):
+        return self.content_layout
+
+    def set_expanded(self, expanded):
+        if self.is_expanded != expanded:
+            self.toggle()
+
+
+# Widget per la distribuzione dei pesi
+class WeightDistributionWidget(QWidget):
+    weightChanged = Signal()
+
+    def __init__(self, years=5, last_year=None, parent=None):
+        super().__init__(parent)
+        self.years = years
+        self.last_year = last_year or datetime.datetime.now().year
+        self.weights = [0.0] * years
+        self.spinboxes = []
+        self.year_labels = []
+        self.currently_updating = False
+        self.last_modified_index = -1
+
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        header_layout = QHBoxLayout()
+        header_layout.addWidget(QLabel("Anno di osservazione"))
+        header_layout.addWidget(QLabel("Peso (%)"))
+        layout.addLayout(header_layout)
+
+        self.grid_layout = QGridLayout()
+
+        self.year_labels = []
+        self.spinboxes = []
+
+        for i in range(self.years):
+            actual_year = self.last_year - i
+
+            year_label = QLabel(f"{actual_year}")
+            self.grid_layout.addWidget(year_label, i, 0)
+            self.year_labels.append(year_label)
+
+            weight_spin = QSpinBox()
+            weight_spin.setRange(0, 100)
+            weight_spin.setValue(int(self.weights[i]))
+            weight_spin.setSuffix("%")
+            weight_spin.setProperty("index", i)
+            weight_spin.valueChanged.connect(self.on_weight_changed)
+            self.grid_layout.addWidget(weight_spin, i, 1)
+            self.spinboxes.append(weight_spin)
+
+        layout.addLayout(self.grid_layout)
+
+        preset_frame = QFrame()
+        preset_layout = QHBoxLayout(preset_frame)
+
+        preset_label = QLabel("Preimpostazioni:")
+        preset_layout.addWidget(preset_label)
+
+        uniform_button = QPushButton("Uniforme")
+        uniform_button.clicked.connect(self.set_uniform_distribution)
+        preset_layout.addWidget(uniform_button)
+
+        preset_layout.addStretch()
+
+        layout.addWidget(preset_frame)
+
+        self.total_weight_label = QLabel("Peso totale: 100.0%")
+        self.total_weight_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.total_weight_label)
+
+    def update_year_labels(self, new_last_year):
+        """Aggiorna le etichette degli anni"""
+        if new_last_year != self.last_year:
+            self.last_year = new_last_year
+            for i in range(min(self.years, len(self.year_labels))):
+                actual_year = self.last_year - i
+                self.year_labels[i].setText(f"{actual_year}")
+
+    def on_weight_changed(self, new_value):
+        """Gestisce il cambiamento di un peso"""
+        if self.currently_updating:
+            return
+
+        sender = self.sender()
+        if not sender:
+            return
+
+        index = sender.property("index")
+        self.last_modified_index = index
+
+        self.weights[index] = float(new_value)
+
+        total = sum(self.weights)
+
+        if total > 100:
+            excess = total - 100
+            self.weights[index] -= excess
+
+            self.currently_updating = True
+            sender.setValue(int(self.weights[index]))
+            self.currently_updating = False
+
+        self.update_total_label()
+        self.weightChanged.emit()
+
+    def update_total_label(self):
+        """Aggiorna l'etichetta del peso totale"""
+        total = sum(self.weights)
+        self.total_weight_label.setText(f"Peso totale: {total:.1f}%")
+
+    def set_uniform_distribution(self):
+        """Imposta una distribuzione uniforme dei pesi"""
+        self.currently_updating = True
+
+        uniform_weight = 100.0 / self.years
+        self.weights = [uniform_weight] * self.years
+
+        for i, spinbox in enumerate(self.spinboxes):
+            spinbox.setValue(int(self.weights[i]))
+
+        self.currently_updating = False
+
+        self.update_total_label()
+        self.weightChanged.emit()
+
+    def update_years(self, years):
+        """Aggiorna il numero di anni"""
+        if self.years == years:
+            return
+
+        old_years = self.years
+        self.years = years
+
+        for label in self.year_labels:
+            label.deleteLater()
+        for spinbox in self.spinboxes:
+            spinbox.deleteLater()
+
+        self.year_labels = []
+        self.spinboxes = []
+
+        self.weights = [0.0] * years
+
+        for i in range(self.years):
+            actual_year = self.last_year - i
+
+            year_label = QLabel(f"{actual_year}")
+            self.grid_layout.addWidget(year_label, i, 0)
+            self.year_labels.append(year_label)
+
+            weight_spin = QSpinBox()
+            weight_spin.setRange(0, 100)
+            weight_spin.setValue(int(self.weights[i]))
+            weight_spin.setSuffix("%")
+            weight_spin.setProperty("index", i)
+            weight_spin.valueChanged.connect(self.on_weight_changed)
+            self.grid_layout.addWidget(weight_spin, i, 1)
+            self.spinboxes.append(weight_spin)
+
+        self.update_total_label()
+        self.weightChanged.emit()
+
+    def get_weights(self):
+        """Restituisce i pesi come lista di float"""
+        return self.weights
+
+
+# Lavoratore per l'elaborazione in background
+# ======= AnalysisWorker (modificato) =======
+class AnalysisWorker(QObject):
+    progress_updated = Signal(int)
+    status_updated = Signal(str)
+    finished = Signal(dict)
+    error_occurred = Signal(str)
+
+    def __init__(self, btype, uwy_max, cluster_configuration=None):
+        super().__init__()
+
+        self.btype = btype
+        self.dec_cut_point = DEC_CUT_POINT
+        self.uwy_max = uwy_max
+        self.cluster_configuration = cluster_configuration
+
+        # Fisso il nome del field cluster
+        global CLUSTER_COLUMN
+        CLUSTER_COLUMN = 'Cluster'
+
+        # Ordine corretto delle antidurate
+        self.antidurata_order = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10-15', '15-20+']
+
+    def update_progress(self, value):
+        self.progress_updated.emit(value)
+
+    def run(self):
+        try:
+            self.status_updated.emit("Avvio elaborazione...")
+            results = self.lapse_results(self.btype, self.dec_cut_point, self.uwy_max)
+            self.finished.emit(results)
+        except Exception as e:
+            import traceback
+            error_msg = f"Errore durante l'analisi: {str(e)}\n\n{traceback.format_exc()}"
+            print(error_msg)
+            self.error_occurred.emit(str(e))
+
+    def normalize_column_name(self, col_name):
+        """Normalizza il nome della colonna per il matching case-insensitive"""
+        if pd.isna(col_name):
+            return col_name
+        # Converti in lowercase
+        normalized = str(col_name).lower()
+        # Sostituisci underscore con spazi
+        normalized = normalized.replace('_', ' ')
+        # Rimuovi spazi extra
+        normalized = ' '.join(normalized.split())
+        return normalized
+
+    def normalize_dataframe_columns(self, df):
+        """Normalizza tutti i nomi delle colonne in un dataframe"""
+        df.columns = [self.normalize_column_name(col) for col in df.columns]
+        return df
+
+    def read_single_file(self, file_path):
+        """Legge un singolo file e normalizza le colonne"""
+        try:
+            if file_path.lower().endswith('.sas7bdat'):
+                df, meta = pyreadstat.read_sas7bdat(file_path)
+            elif file_path.lower().endswith(('.csv', '.txt')):
+                # Prova prima con separatore ;
+                try:
+                    df = pd.read_csv(file_path, sep=';', decimal=',')
+                    if len(df.columns) == 1:  # Probabilmente separatore sbagliato
+                        raise ValueError("Separatore errato")
+                except:
+                    # Prova con separatore ,
+                    df = pd.read_csv(file_path, sep=',')
+
+                # Rimuovi colonne senza nome
+                df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
+                df = df.dropna(axis=1, how='all')
+
+            elif file_path.lower().endswith('.xlsx'):
+                df = pd.read_excel(file_path)
+            else:
+                raise ValueError(f"Formato file non supportato: {file_path}")
+
+            # Normalizza i nomi delle colonne
+            df = self.normalize_dataframe_columns(df)
+
+
+            return df
+
+        except Exception as e:
+            print(f"  ERRORE nella lettura del file {file_path}: {e}")
+            raise
+
+    def read_data_folder(self, folder_path, file_type="unknown"):
+        """Legge e accoda tutti i file supportati in una cartella"""
+        try:
+            print(f"\n  Lettura cartella {file_type}: {folder_path}")
+
+            supported_extensions = ['.csv', '.txt', '.xlsx', '.sas7bdat']
+            files_found = []
+
+            # Trova tutti i file supportati
+            for file in os.listdir(folder_path):
+                if any(file.lower().endswith(ext) for ext in supported_extensions):
+                    files_found.append(file)
+
+            if not files_found:
+                raise ValueError(f"Nessun file supportato trovato nella cartella {folder_path}")
+
+            print(f"  Trovati {len(files_found)} file da processare")
+
+            # Leggi e accoda i file
+            all_dfs = []
+            separator_info = {}
+            column_mismatches = []
+
+            for idx, file in enumerate(files_found):
+                file_path = os.path.join(folder_path, file)
+                print(f"    Lettura file {idx + 1}/{len(files_found)}: {file}")
+
+                try:
+                    df = self.read_single_file(file_path)
+
+                    # Traccia il separatore per i CSV
+                    if file.lower().endswith(('.csv', '.txt')):
+                        # Determina il separatore usato
+                        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                            first_line = f.readline()
+                            if ';' in first_line:
+                                separator_info[file] = ';'
+                            else:
+                                separator_info[file] = ','
+
+                    # Se è il primo file, usa le sue colonne come riferimento
+                    if idx == 0:
+                        reference_columns = set(df.columns)
+                        all_dfs.append(df)
+                    else:
+                        # Controlla se le colonne coincidono
+                        current_columns = set(df.columns)
+
+                        # Trova colonne mancanti e extra
+                        missing_cols = reference_columns - current_columns
+                        extra_cols = current_columns - reference_columns
+
+                        if missing_cols or extra_cols:
+                            column_mismatches.append({
+                                'file': file,
+                                'missing': missing_cols,
+                                'extra': extra_cols
+                            })
+
+                        all_dfs.append(df)
+
+                except Exception as e:
+                    print(f"    ERRORE nel file {file}: {e}")
+                    self.status_updated.emit(f"Errore nel file {file}: {str(e)}")
+                    continue
+
+            if not all_dfs:
+                raise ValueError("Nessun file è stato caricato con successo")
+
+            # Controlla coerenza separatori CSV
+            if len(set(separator_info.values())) > 1:
+                sep_details = "\n".join([f"  {f}: {s}" for f, s in separator_info.items()])
+                self.status_updated.emit(
+                    f"ATTENZIONE: Trovati separatori diversi nei file CSV:\n{sep_details}"
+                )
+
+            # Accoda tutti i dataframe
+            print(f"  Accodamento di {len(all_dfs)} dataframe...")
+            combined_df = pd.concat(all_dfs, ignore_index=True, sort=False)
+
+            # Segnala eventuali problemi di colonne
+            if column_mismatches:
+                mismatch_msg = "ATTENZIONE: Alcune colonne non coincidono tra i file:\n"
+                for mismatch in column_mismatches:
+                    mismatch_msg += f"\nFile: {mismatch['file']}\n"
+                    if mismatch['missing']:
+                        mismatch_msg += f"  Colonne mancanti: {', '.join(mismatch['missing'])}\n"
+                    if mismatch['extra']:
+                        mismatch_msg += f"  Colonne extra: {', '.join(mismatch['extra'])}\n"
+
+                self.status_updated.emit(mismatch_msg)
+
+            # Controlla tipi di dati e converti in stringa se necessario
+            type_conversions = []
+            for col in combined_df.columns:
+                col_types = combined_df[col].apply(type).value_counts()
+                if len(col_types) > 1:
+                    # Tipi misti, converti in stringa
+                    combined_df[col] = combined_df[col].astype(str)
+                    type_conversions.append(col)
+
+            if type_conversions:
+                self.status_updated.emit(
+                    f"ATTENZIONE: Le seguenti colonne sono state convertite in testo per "
+                    f"compatibilità: {', '.join(type_conversions)}"
+                )
+
+            print(f"  Dataframe combinato: {combined_df.shape[0]} righe, {combined_df.shape[1]} colonne")
+            print(f"  Colonne: {combined_df.columns.tolist()}")
+
+            return combined_df
+
+        except Exception as e:
+            print(f"  ERRORE nella lettura della cartella {folder_path}: {e}")
+            raise
+
+    def create_cluster_column(self, df):
+        """Crea sempre la colonna 'Cluster' combinando le colonne selezionate"""
+        if not self.cluster_configuration:
+            return df
+
+        # Normalizza i nomi delle colonne nella configurazione
+        normalized_config_cols = [self.normalize_column_name(col) for col in self.cluster_configuration['columns']]
+
+        # Verifica che tutte le colonne esistano
+        missing_cols = [col for col in normalized_config_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Colonne mancanti per creare il cluster: {missing_cols}")
+
+        # Crea il cluster
+        df['cluster'] = df[normalized_config_cols[0]].astype(str)
+        for col in normalized_config_cols[1:]:
+            df['cluster'] += "_" + df[col].astype(str)
+
+        return df
+
+    def validate_antidurata_values(self, df, col_name='antidurata arrotondata'):
+        """Valida e corregge i valori di antidurata arrotondata"""
+        if col_name not in df.columns:
+            return df, False
+
+        # Valori validi
+        valid_values = set(self.antidurata_order)
+
+        # Trova valori non validi
+        unique_values = df[col_name].dropna().unique()
+        invalid_values = [v for v in unique_values if str(v) not in valid_values]
+
+        if invalid_values:
+            print(f"  ATTENZIONE: Trovati valori non validi in '{col_name}': {invalid_values}")
+            return df, True  # Necessita fallback
+
+        # Converti in stringa per sicurezza
+        df[col_name] = df[col_name].astype(str)
+
+        return df, False
+
+    def calculate_antidurata_fallback(self, df, year_col, dec_col):
+        """Calcola antidurata arrotondata come fallback"""
+        print(f"  Calcolo fallback antidurata usando '{year_col}' - '{dec_col}'")
+
+        # Calcola antidurata grezza
+        df['antidurata_calc'] = pd.to_numeric(df[year_col], errors='coerce') - pd.to_numeric(df[dec_col],
+                                                                                             errors='coerce')
+
+        # Mappa ai valori standard
+        def map_antidurata(x):
+            if pd.isna(x) or x < 1:
+                return None
+            elif x <= 9:
+                return str(int(x))
+            elif x <= 15:
+                return '10-15'
+            else:
+                return '15-20+'
+
+        df['antidurata arrotondata'] = df['antidurata_calc'].apply(map_antidurata)
+        df = df.drop('antidurata_calc', axis=1)
+
+        return df
+
+    def process_exposure_data(self, dec_cut_point):
+        """Legge il DB Riserve e lo processa"""
+        self.status_updated.emit("Elaborazione dati di esposizione (riserve)...")
+        self.update_progress(10)
+        start_time = time.time()
+
+        # Leggi tutti i file dalla cartella
+        exposure_folder = DATABASE_EXPOSITION_PATH
+        exposure_data = self.read_data_folder(exposure_folder, "Riserve")
+
+        if exposure_data is None:
+            raise ValueError("Impossibile leggere i dati di esposizione")
+
+        # NUOVA MODIFICA: Rinomina "Cod Premio" in "Tipo_premio" se presente
+        cod_premio_col = next((c for c in exposure_data.columns if "cod premio" in c.lower()), None)
+        if cod_premio_col:
+            exposure_data.rename(columns={cod_premio_col: 'tipo premio'}, inplace=True)
+            print(f"  Rinominata colonna '{cod_premio_col}' in 'tipo premio'")
+
+
+        # Crea la colonna 'Cluster'
+        exposure_data = self.create_cluster_column(exposure_data)
+
+        # Trova la colonna 'Periodo di osservazione' (case-insensitive)
+        period_col = next((c for c in exposure_data.columns if "periodo di osservazione" in c.lower()), None)
+        if not period_col:
+            raise ValueError("Colonna 'Periodo di osservazione' non trovata nel database Riserve")
+
+        # Rinomina per coerenza interna
+        exposure_data["investigation_year_(end)"] = (
+            pd.to_numeric(exposure_data[period_col], errors="coerce")
+            .round()  # ← arrotonda 2020.3 → 2020
+            .astype("Int64")
+        )
+
+        # Verifica colonna Antidurata arrotondata
+        antidurata_col = next((c for c in exposure_data.columns if "antidurata arrotondata" in c.lower()), None)
+
+        if not antidurata_col:
+            # Fallback: calcola da periodo - anno decorrenza
+            anno_dec_col = next((c for c in exposure_data.columns if "anno decorrenza" in c.lower()), None)
+            if anno_dec_col:
+                exposure_data = self.calculate_antidurata_fallback(
+                    exposure_data, period_col, anno_dec_col
+                )
+            else:
+                raise ValueError("Colonna 'Antidurata arrotondata' non trovata e impossibile calcolare fallback")
+        else:
+            # Rinomina per coerenza
+            exposure_data.rename(columns={antidurata_col: 'antidurata arrotondata'}, inplace=True)
+
+        # Valida i valori di antidurata
+        exposure_data, needs_fallback = self.validate_antidurata_values(exposure_data)
+
+        # Verifica colonna Riserva
+        riserva_col = next((c for c in exposure_data.columns if "riserva" in c.lower() and "base" not in c.lower()),
+                           None)
+        if not riserva_col:
+            raise ValueError("Colonna 'Riserva' non trovata nel database Riserve")
+
+        # Converti Riserva a numerico
+        if exposure_data[riserva_col].dtype == object:
+            # Gestione formato europeo
+            exposure_data[riserva_col] = exposure_data[riserva_col].str.replace(".", "", regex=False)
+            exposure_data[riserva_col] = exposure_data[riserva_col].str.replace(",", ".", regex=False)
+
+        exposure_data['exposure_amount'] = pd.to_numeric(exposure_data[riserva_col], errors="coerce").fillna(0)
+        exposure_data['exposure_count'] = 1
+
+        # Raggruppa per Cluster, Investigation_Year e Antidurata
+        groupby_cols = ["cluster", "investigation_year_(end)", "antidurata arrotondata"]
+
+        exposure_agg = (
+            exposure_data
+            .groupby(groupby_cols, dropna=False)
+            .agg({
+                'exposure_amount': 'sum',
+                'exposure_count': 'sum'
+            })
+            .reset_index()
+        )
+
+        # Rinomina le colonne per l'output finale
+        exposure_agg.rename(columns={
+            'cluster': 'Cluster',
+            'investigation_year_(end)': 'Investigation_Year_(end)',
+            'antidurata arrotondata': 'Antidurate_Grouped',
+            'exposure_amount': 'Exposure_Amount',
+            'exposure_count': 'Exposure_Count'
+        }, inplace=True)
+
+        elapsed = time.time() - start_time
+        print(f"  Dati di esposizione elaborati: {exposure_agg.shape[0]} righe, {exposure_agg.shape[1]} colonne")
+        print(f"  Antidurate presenti: {sorted(exposure_agg['Antidurate_Grouped'].unique())}")
+        print(f"  Tempo di elaborazione (exposure): {elapsed:.2f} s")
+
+        return exposure_agg
+
+    def process_claims_data(self, btype):
+        """Legge il DB Riscatti e lo processa"""
+        self.status_updated.emit("Elaborazione dati di sinistri (riscatti)…")
+        self.update_progress(30)
+        start_time = time.time()
+
+        # Leggi tutti i file dalla cartella
+        claims_folder = DATABASE_CLAIMS_PATH
+        claims = self.read_data_folder(claims_folder, "Riscatti")
+
+        if claims is None:
+            raise ValueError("Impossibile leggere i dati di sinistri")
+
+        # Crea la colonna 'Cluster'
+        claims = self.create_cluster_column(claims)
+
+        # Estrai anno di osservazione da 'dtdatarif liquidato'
+        dtdatarif_col = next((c for c in claims.columns if "dtdatarif" in c.lower() and "liquidato" in c.lower()), None)
+        if not dtdatarif_col:
+            # Fallback su solo dtdatarif
+            dtdatarif_col = next((c for c in claims.columns if "dtdatarif" in c.lower()), None)
+            if not dtdatarif_col:
+                raise ValueError("Colonna 'dtdatarif liquidato' non trovata nel database Riscatti")
+
+        claims["investigation_year_(end)"] = pd.to_datetime(claims[dtdatarif_col], errors="coerce").dt.year
+
+        # Verifica colonna Antidurata arrotondata
+        antidurata_col = next((c for c in claims.columns if "antidurata arrotondata" in c.lower()), None)
+
+        if not antidurata_col:
+            # Fallback: calcola da periodo - anno dec
+            period_col = next((c for c in claims.columns if "periodo di osservazione" in c.lower()), None)
+            anno_dec_col = next((c for c in claims.columns if "anno dec" in c.lower()), None)
+
+            if period_col and anno_dec_col:
+                claims = self.calculate_antidurata_fallback(claims, period_col, anno_dec_col)
+            else:
+                raise ValueError("Colonna 'Antidurata arrotondata' non trovata e impossibile calcolare fallback")
+        else:
+            # Rinomina per coerenza
+            claims.rename(columns={antidurata_col: 'antidurata arrotondata'}, inplace=True)
+
+        # Valida i valori di antidurata
+        claims, needs_fallback = self.validate_antidurata_values(claims)
+
+        # Rimuovi righe con antidurata non valida
+        claims = claims.dropna(subset=["antidurata arrotondata"])
+
+        # Converti 'Riscatto' a numerico
+        riscatto_col = next((c for c in claims.columns if "riscatto" in c.lower()), None)
+        if not riscatto_col:
+            raise ValueError("Colonna 'Riscatto' non trovata nel database Riscatti")
+
+        # Gestione formato europeo
+        if claims[riscatto_col].dtype == object:
+            claims[riscatto_col] = claims[riscatto_col].str.replace(".", "", regex=False)
+            claims[riscatto_col] = claims[riscatto_col].str.replace(",", ".", regex=False)
+
+        claims["riscatto_amount"] = pd.to_numeric(claims[riscatto_col], errors="coerce").fillna(0)
+
+        # Verifica colonna Classificazione
+        classif_col = next((c for c in claims.columns if "classificazione" in c.lower()), None)
+        if not classif_col:
+            raise ValueError("Colonna 'Classificazione' non trovata nel database Riscatti")
+
+        # Crea colonne per importi per tipo
+        claims["importo_definitivo"] = np.where(
+            claims[classif_col] == "Uscita definitiva",
+            claims["riscatto_amount"],
+            0
+        )
+        claims["importo_reworked"] = np.where(
+            claims[classif_col] == "Riscatto reworkato",
+            claims["riscatto_amount"],
+            0
+        )
+
+        # Flag per conteggi
+        claims["is_definitivo"] = (claims[classif_col] == "Uscita definitiva").astype(int)
+        claims["is_reworked"] = (claims[classif_col] == "Riscatto reworkato").astype(int)
+
+        # Raggruppa
+        groupby_cols = ["cluster", "investigation_year_(end)", "antidurata arrotondata"]
+
+        # Trova colonna numero polizza
+        nrpolizza_col = next((c for c in claims.columns if "nrpolizza" in c.lower() or "nr polizza" in c.lower()), None)
+        if not nrpolizza_col:
+            raise ValueError("Colonna 'nrpolizza' non trovata")
+
+        agg_claims = (
+            claims
+            .groupby(groupby_cols, dropna=False)
+            .agg({
+                'riscatto_amount': 'sum',  # Importi_Totali
+                'importo_definitivo': 'sum',  # Importi_UsciteDefinitive
+                'importo_reworked': 'sum',  # Importi_Reworked
+                nrpolizza_col: 'count',  # Teste_Totali
+                'is_definitivo': 'sum',  # Teste_UsciteDefinitive
+                'is_reworked': 'sum'  # Teste_Reworked
+            })
+            .reset_index()
+        )
+
+        # Rinomina le colonne
+        agg_claims.rename(columns={
+            'cluster': 'Cluster',
+            'investigation_year_(end)': 'Investigation_Year_(end)',
+            'antidurata arrotondata': 'Antidurate_Grouped',
+            'riscatto_amount': 'Importi_Totali',
+            'importo_definitivo': 'Importi_UsciteDefinitive',
+            'importo_reworked': 'Importi_Reworked',
+            nrpolizza_col: 'Teste_Totali',
+            'is_definitivo': 'Teste_UsciteDefinitive',
+            'is_reworked': 'Teste_Reworked'
+        }, inplace=True)
+
+        elapsed = time.time() - start_time
+        print(f"  Dati di sinistri elaborati: {agg_claims.shape[0]} righe, {agg_claims.shape[1]} colonne")
+        print(f"  Antidurate presenti: {sorted(agg_claims['Antidurate_Grouped'].unique())}")
+        print(f"  Tempo di elaborazione (claims): {elapsed:.2f} s")
+
+        return agg_claims
+
+    def join_exposure_claims(self, exposure_agg, agg_claims):
+        """Esegue un merge tra esposizione e sinistri sulle chiavi comuni"""
+        self.status_updated.emit("Join esposizione/sinistri…")
+        self.update_progress(70)
+        start = time.time()
+
+        key = ["Cluster", "Investigation_Year_(end)", "Antidurate_Grouped"]
+
+        # Merge outer per mantenere tutti i record
+        full = pd.merge(
+            exposure_agg,
+            agg_claims,
+            how="outer",
+            on=key
+        )
+
+        # Riempio i NaN con 0 per tutte le colonne numeriche
+        numeric_cols = [col for col in full.columns if col not in key]
+        full[numeric_cols] = full[numeric_cols].fillna(0)
+
+        elapsed = time.time() - start
+        print(f"  Join completato: {full.shape[0]} righe, {full.shape[1]} colonne – {elapsed:.2f} s")
+        return full
+
+    def aggregate_results(self, joined_df, uwy_max_unused=None):
+        """Restituisce il dataframe già aggregato senza ulteriori trasformazioni"""
+        self.status_updated.emit("Preparazione risultati finali…")
+        self.update_progress(85)
+        start_time = time.time()
+
+        # Il dataframe è già nel formato corretto
+        res = joined_df.copy()
+
+        # Assicuriamoci che Cluster non abbia valori NaN
+        res["Cluster"] = res["Cluster"].fillna("__NULL__")
+
+        elapsed = time.time() - start_time
+        print(f"  Risultato finale: {len(res)} righe, {res.shape[1]} colonne – {elapsed:.2f} s")
+        return res
+
+    def export_to_excel(self, dataframes):
+        """Esporta i dataframe in file Excel"""
+        print("\nEsportazione risultati in Excel...")
+        if not OUTPUT_PATH:
+            print("  ERRORE: percorso di output non definito.")
+            return
+
+        for name, df in dataframes.items():
+            file_path = os.path.join(OUTPUT_PATH, f"{name}.xlsx")
+            print(f"  Esportazione {name} in {file_path}...")
+            try:
+                df.to_excel(file_path, index=False)
+                print(f"  Esportazione di {name} completata con successo")
+            except Exception as e:
+                print(f"  ERRORE durante l'esportazione di {name}: {e}")
+
+        try:
+            encryption = EncryptionHandler()
+            for name, df in dataframes.items():
+                csv_path = os.path.join(OUTPUT_PATH, f"{name}.csv")
+                df.to_csv(csv_path, index=False)
+
+                enc_path = os.path.join(OUTPUT_PATH, f"{name}.csv.enc")
+                encryption.encrypt_file(csv_path, enc_path)
+                print(f"  File criptato salvato in {enc_path}")
+                os.remove(csv_path)
+        except Exception as e:
+            print(f"  ERRORE durante la criptazione dei file: {e}")
+
+    def lapse_results(self, btype, dec_cut_point, uwy_max):
+        """Implementazione principale del calcolo Lapse Results"""
+        total_start_time = time.time()
+        print(
+            f"Avvio calcolo Lapse Results con parametri: "
+            f"Tipo Business={btype}, DecCutPoint={dec_cut_point}, UWYmax={uwy_max}"
+        )
+
+        # Step 1: Esposizione
+        print("\nStep 1: Elaborazione dati di esposizione...")
+        i_tariff_wise_lapse_exposure = self.process_exposure_data(dec_cut_point)
+
+        # Step 2: Sinistri
+        print(f"\nStep 2: Elaborazione dati di sinistri per tipo di business {btype}...")
+        i_tariff_wise_lapse_claims = self.process_claims_data(btype)
+
+        # Step 3: Join
+        print("\nStep 3: Join dei dati di esposizione e sinistri...")
+        res_lps_i_per_tariff = self.join_exposure_claims(
+            i_tariff_wise_lapse_exposure,
+            i_tariff_wise_lapse_claims
+        )
+
+        # Step 4: Aggregazione
+        print("\nStep 4: Aggregazione risultato finale (res_lps_output)...")
+        res_lps_output = self.aggregate_results(res_lps_i_per_tariff)
+
+        total_end_time = time.time()
+        print(f"\nCalcolo Lapse Results completato con successo!")
+        print(f"Tempo totale di elaborazione: {total_end_time - total_start_time:.2f} secondi")
+
+        # Step 5: Esportazione
+        try:
+            to_export = {"res_lps_output": res_lps_output}
+            print("\nEsportazione automatica di 'res_lps_output' nella cartella di output...")
+            self.export_to_excel(to_export)
+            print(f"  File 'res_lps_output.xlsx' (e relativo .csv.enc) creati con successo in {OUTPUT_PATH}")
+        except Exception as e:
+            print(f"  ERRORE durante l'esportazione automatica: {e}")
+
+        self.update_progress(100)
+        return {
+            "i_tariff_wise_lapse_exposure": i_tariff_wise_lapse_exposure,
+            "i_tariff_wise_lapse_claims": i_tariff_wise_lapse_claims,
+            "res_lps_i_per_tariff": res_lps_i_per_tariff,
+            "res_lps_output": res_lps_output
+        }
+
+    def calculate_lapse_rates(
+            self,
+            res_lps_output: pd.DataFrame,
+            last_evaluation_year: int,
+            observation_years: int,
+            year_weights: list[float] | None = None,
+            use_amounts: bool = True,
+            include_total: bool = True,
+            include_partial: bool = True,
+            selected_companies=None,
+            selected_clusters=None
+    ):
+        """Calcola i tassi di riscatto usando la struttura con antidurate"""
+        print("\nCalcolo tassi di riscatto…")
+        print(f"  Parametri: Anno valutazione={last_evaluation_year}, Anni osservazione={observation_years}")
+        print(f"  Pesature: {year_weights if year_weights else 'uniforme'}")
+        print(f"  Base di calcolo: {'Importi' if use_amounts else 'Numero pezzi'}")
+        print(f"  Tipi di riscatto: "
+              f"{'Definitivi' if include_total else ''}"
+              f"{' e ' if include_total and include_partial else ''}"
+              f"{'Reworkati' if include_partial else ''}")
+
+        # Filtro cluster
+        data = res_lps_output.copy()
+        if selected_clusters:
+            sel = [str(x) for x in selected_clusters]
+            data = data[data['Cluster'].astype(str).isin(sel)]
+            print(f"  Filtrato su Cluster → {len(data)} righe")
+
+        # Intervallo anni di osservazione
+        years_to_use = list(range(last_evaluation_year - observation_years + 1,
+                                  last_evaluation_year + 1))
+        data = data[data['Investigation_Year_(end)'].isin(years_to_use)]
+
+        # Calcolo Claims_Value basato sui flag
+        if use_amounts:
+            if include_total and include_partial:
+                data['Claims_Value'] = data['Importi_Totali']
+            elif include_total:
+                data['Claims_Value'] = data['Importi_UsciteDefinitive']
+            elif include_partial:
+                data['Claims_Value'] = data['Importi_Reworked']
+            else:
+                data['Claims_Value'] = 0
+
+            data['Exposure_Value'] = data['Exposure_Amount']
+        else:
+            if include_total and include_partial:
+                data['Claims_Value'] = data['Teste_Totali']
+            elif include_total:
+                data['Claims_Value'] = data['Teste_UsciteDefinitive']
+            elif include_partial:
+                data['Claims_Value'] = data['Teste_Reworked']
+            else:
+                data['Claims_Value'] = 0
+
+            data['Exposure_Value'] = data['Exposure_Count']
+
+        # Calcolo del tasso di riscatto
+        data['Lapse_Rate'] = np.where(
+            data['Exposure_Value'] > 0,
+            data['Claims_Value'] / data['Exposure_Value'],
+            0
+        )
+
+        # Selezione colonne per output
+        lapse_by_year = data[['Cluster', 'Antidurate_Grouped', 'Investigation_Year_(end)',
+                              'Claims_Value', 'Exposure_Value', 'Lapse_Rate']].copy()
+
+        # Media pesata sulla finestra mobile
+        if year_weights and len(year_weights) == observation_years:
+            weights = [w / 100. for w in year_weights]
+        else:
+            weights = [1.0 / observation_years] * observation_years
+
+        lapse_avg_lst = []
+        for (cluster, antidurata), grp in lapse_by_year.groupby(['Cluster', 'Antidurate_Grouped']):
+            grp = grp.sort_values('Investigation_Year_(end)', ascending=False).head(observation_years)
+            if len(grp) < observation_years:
+                continue
+
+            # Calcolo media ponderata
+            w_claims = sum(c * w for c, w in zip(grp['Claims_Value'], weights))
+            w_expo = sum(e * w for e, w in zip(grp['Exposure_Value'], weights))
+            rate = (w_claims / w_expo) if w_expo > 0 else 0
+
+            lapse_avg_lst.append({
+                'Cluster': cluster,
+                'Antidurate_Grouped': antidurata,
+                'Claims_Value': w_claims,
+                'Exposure_Value': w_expo,
+                'Lapse_Rate': rate
+            })
+
+        lapse_avg = pd.DataFrame(lapse_avg_lst)
+
+        # Pivot per visualizzazioni
+        lapse_by_year_pivot = (
+            lapse_by_year
+            .pivot_table(
+                index=['Cluster', 'Investigation_Year_(end)'],
+                columns='Antidurate_Grouped',
+                values='Lapse_Rate',
+                aggfunc='first'
+            )
+            .reset_index()
+        )
+
+        lapse_avg_pivot = (
+            lapse_avg
+            .pivot_table(
+                index='Cluster',
+                columns='Antidurate_Grouped',
+                values='Lapse_Rate',
+                aggfunc='first'
+            )
+            .reset_index()
+        )
+
+        exposure_pivot = (
+            lapse_by_year
+            .pivot_table(
+                index=['Cluster', 'Investigation_Year_(end)'],
+                columns='Antidurate_Grouped',
+                values='Exposure_Value',
+                aggfunc='first'
+            )
+            .reset_index()
+        )
+
+        claims_pivot = (
+            lapse_by_year
+            .pivot_table(
+                index=['Cluster', 'Investigation_Year_(end)'],
+                columns='Antidurate_Grouped',
+                values='Claims_Value',
+                aggfunc='first'
+            )
+            .reset_index()
+        )
+
+        print("  Tassi di riscatto calcolati con successo")
+        return {
+            'lapse_rates_by_year': lapse_by_year,
+            'lapse_rates_avg': lapse_avg,
+            'lapse_rates_by_year_pivot': lapse_by_year_pivot,
+            'lapse_rates_avg_pivot': lapse_avg_pivot,
+            'exposure_pivot': exposure_pivot,
+            'claims_pivot': claims_pivot
+        }
+
+    def export_lapse_rates_to_excel(self, lapse_rates_data, config):
+        """Esporta i tassi di riscatto in un file Excel"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            None,
+            "Salva risultati tassi di riscatto",
+            os.path.join(OUTPUT_PATH, 'Lapse_Rates.xlsx'),
+            "Excel Files (*.xlsx);;All Files (*)"
+        )
+
+        if not file_path:
+            print("Esportazione annullata dall'utente.")
+            return
+
+        print(f"\nEsportazione tassi di riscatto in {file_path}...")
+
+        metadata_data = [
+            ['Anno di valutazione', config['last_year']],
+            ['Anni di osservazione', config['obs_years']],
+            ['Distribuzione pesi', ", ".join([f"{w:.1f}%" for w in config['weights']])],
+            ['Base di calcolo', 'Importi' if config['use_amounts'] else 'Numero pezzi'],
+            ['Includi riscatti definitivi', 'Sì' if config['include_total'] else 'No'],
+            ['Includi riscatti reworkati', 'Sì' if config['include_partial'] else 'No'],
+            ['Cluster', ", ".join(config['clusters']) if config['clusters'] else 'Tutti i cluster'],
+            ['Data elaborazione', datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')]
+        ]
+
+        metadata = pd.DataFrame(metadata_data, columns=['Parametro', 'Valore'])
+
+        with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+            metadata.to_excel(writer, sheet_name='Configurazione', index=False)
+            lapse_rates_data['lapse_rates_by_year'].to_excel(writer, sheet_name='Lapse_Rates_By_Year', index=False)
+            lapse_rates_data['lapse_rates_avg'].to_excel(writer, sheet_name='Lapse_Rates_Avg', index=False)
+            lapse_rates_data['lapse_rates_by_year_pivot'].to_excel(writer, sheet_name='Lapse_Rates_Pivot', index=False)
+            lapse_rates_data['lapse_rates_avg_pivot'].to_excel(writer, sheet_name='Lapse_Rates_Avg_Pivot', index=False)
+            lapse_rates_data['exposure_pivot'].to_excel(writer, sheet_name='Exposure', index=False)
+            lapse_rates_data['claims_pivot'].to_excel(writer, sheet_name='Claims', index=False)
+
+        # Versione criptata
+        try:
+            encryption = EncryptionHandler()
+            enc_output_file = file_path + '.enc'
+            encryption.encrypt_file(file_path, enc_output_file)
+            print(f"  Versione criptata salvata in: {enc_output_file}")
+        except Exception as e:
+            print(f"  ERRORE durante la criptazione del file: {e}")
+
+        print("  Esportazione tassi di riscatto completata con successo")
+
+
+
+class LapseRatesDialog(QDialog):
+    def __init__(self, res_lps_output, parent=None):
+        super().__init__(parent)
+
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinimizeButtonHint |
+                            Qt.WindowMaximizeButtonHint | Qt.WindowSystemMenuHint)
+
+        self.res_lps_output = res_lps_output
+        self.setWindowTitle("Calcolo Tassi di Riscatto")
+        self.setMinimumSize(1000, 800)
+
+        # ---------------------------------------------------
+        # Calcolo qui la lista degli anni unici disponibili:
+        # ---------------------------------------------------
+        # Se la colonna Investigation_Year_(end) non esiste o è vuota,
+        # assegno comunque una lista minima.
+        if 'Investigation_Year_(end)' in self.res_lps_output.columns and \
+           not self.res_lps_output['Investigation_Year_(end)'].dropna().empty:
+            self.available_years = sorted(
+                self.res_lps_output['Investigation_Year_(end)']
+                    .dropna()
+                    .astype(int)
+                    .unique()
+            )
+        else:
+            # di fallback, se per qualche ragione non ci sono anni
+            self.available_years = [datetime.datetime.now().year]
+
+        # ---------------------------------------------------
+        # Costruisco l'interfaccia
+        # ---------------------------------------------------
+        self.init_ui()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout()
+
+        # Header
+        header_label = QLabel("Calcolo Tassi di Riscatto")
+        header_label.setStyleSheet(
+            f"background-color: {BLU_PETROLIO}; color: {BIANCO}; "
+            "padding: 15px; font-size: 18px; font-weight: bold;"
+        )
+        main_layout.addWidget(header_label)
+
+        # Contenitore principale con scroll
+        main_scroll_area = QScrollArea()
+        main_scroll_area.setWidgetResizable(True)
+        main_scroll_area.setFrameShape(QFrame.NoFrame)
+
+        main_container = QWidget()
+        container_layout = QVBoxLayout(main_container)
+
+        # Pannello dei parametri (collassabile)
+        self.params_widget = CollapsibleWidget("Parametri e Filtri")
+        params_layout = self.params_widget.get_content_layout()
+
+        # ---------------------------------------------------
+        # 1) Anno di valutazione: lo setto fra min e max degli anni disponibili
+        # ---------------------------------------------------
+        # Determino anno_min e anno_max da usare per la spinbox
+        year_min = min(self.available_years)
+        year_max = max(self.available_years)
+
+        param_year_frame = QWidget()
+        param_year_layout = QGridLayout(param_year_frame)
+
+        param_year_layout.addWidget(
+            QLabel("Anno di valutazione:", styleSheet=f"font-weight: bold; color: {BLU_PETROLIO};"),
+            0, 0
+        )
+
+        self.last_year_spin = QSpinBox()
+        self.last_year_spin.setRange(year_min, year_max)
+        self.last_year_spin.setValue(year_max)
+        param_year_layout.addWidget(self.last_year_spin, 0, 1)
+
+        # Mostro a fianco quali anni reali sono disponibili
+        years_str = f"{year_min}-{year_max}" if year_min != year_max else f"{year_min}"
+        year_range_label = QLabel(f"Anni disponibili nel database: {years_str}")
+        year_range_label.setStyleSheet(f"color: {VERDE_SCURO};")
+        param_year_layout.addWidget(year_range_label, 0, 2)
+
+        description_label = QLabel(
+            "Anno dell'ultima valutazione. Indica il più recente anno di osservazione da considerare.",
+            styleSheet="font-style: italic; color: #777;"
+        )
+        param_year_layout.addWidget(description_label, 1, 0, 1, 3)
+
+        params_layout.addWidget(param_year_frame)
+
+        # ---------------------------------------------------
+        # 2) Spinbox "Anni di osservazione": range da 1 fino al numero di anni disponibili
+        # ---------------------------------------------------
+        param_obs_frame = QWidget()
+        param_obs_layout = QGridLayout(param_obs_frame)
+
+        param_obs_layout.addWidget(
+            QLabel("Anni di osservazione:", styleSheet=f"font-weight: bold; color: {BLU_PETROLIO};"),
+            0, 0
+        )
+
+        self.obs_years_spin = QSpinBox()
+        # setto il range da 1 a len(self.available_years)
+        self.obs_years_spin.setRange(1, len(self.available_years))
+        # di default scelgo tutti gli anni disponibili, quindi len(available_years)
+        self.obs_years_spin.setValue(min(5, len(self.available_years)))
+        # ("min(5, …)" per evitare che, se ci sono meno di 5 anni, si imposti un valore invalido)
+        self.obs_years_spin.valueChanged.connect(self.update_weight_distribution)
+        param_obs_layout.addWidget(self.obs_years_spin, 0, 1)
+
+        description_label = QLabel(
+            "Numero di anni da considerare nel calcolo (media mobile). Valore consigliato: 5 anni.",
+            styleSheet="font-style: italic; color: #777;"
+        )
+        param_obs_layout.addWidget(description_label, 1, 0, 1, 3)
+
+        params_layout.addWidget(param_obs_frame)
+
+        # ---------------------------------------------------
+        # 3) Widget Distribuzione Pesi: verrà istanziato con il numero di anni pari al valore di obs_years_spin
+        # ---------------------------------------------------
+        weights_frame = QGroupBox("Distribuzione pesi per anni di osservazione:")
+        weights_frame.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO};")
+        weights_layout = QVBoxLayout(weights_frame)
+
+        description_label = QLabel(
+            "Specifica il peso percentuale di ogni anno nel calcolo della media mobile. La somma deve essere 100%.",
+            styleSheet="font-style: italic; color: #777; font-weight: normal;"
+        )
+        weights_layout.addWidget(description_label)
+
+        # Inizializzo il widget con il numero corrente di anni selezionati
+        last_year = self.last_year_spin.value()
+        n_obs = self.obs_years_spin.value()
+        self.weight_distribution = WeightDistributionWidget(n_obs, last_year)
+        weights_layout.addWidget(self.weight_distribution)
+
+        # Collegamento per aggiornare l'anno di base ogni volta che cambiano last_year o obs_years
+        self.last_year_spin.valueChanged.connect(self.on_last_year_changed)
+
+        # Container per Base di calcolo (RIMOSSO "Tipo di riscatto")
+        calc_type_container = QWidget()
+        calc_type_layout = QHBoxLayout(calc_type_container)
+
+        # Base di calcolo
+        base_frame = QGroupBox("Base di calcolo:")
+        base_frame.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO};")
+        base_layout = QVBoxLayout(base_frame)
+
+        self.use_amounts_radio = QRadioButton("Importi")
+        self.use_amounts_radio.setChecked(True)
+        description_label1 = QLabel(
+            "Calcola i tassi di riscatto basandosi sugli importi.",
+            styleSheet="font-style: italic; color: #777; font-weight: normal;"
+        )
+
+        self.use_count_radio = QRadioButton("Numero pezzi")
+        description_label2 = QLabel(
+            "Calcola i tassi di riscatto basandosi sul numero di pezzi.",
+            styleSheet="font-style: italic; color: #777; font-weight: normal;"
+        )
+
+        amount_layout = QHBoxLayout()
+        amount_layout.addWidget(self.use_amounts_radio)
+        amount_layout.addWidget(description_label1)
+        amount_layout.addStretch()
+
+        count_layout = QHBoxLayout()
+        count_layout.addWidget(self.use_count_radio)
+        count_layout.addWidget(description_label2)
+        count_layout.addStretch()
+
+        base_layout.addLayout(amount_layout)
+        base_layout.addLayout(count_layout)
+
+        calc_type_layout.addWidget(base_frame)
+
+        weights_layout.addWidget(calc_type_container)
+        params_layout.addWidget(weights_frame)
+
+        # ---------------------------------------------------
+        # 4) Filtri per l'analisi: lista di cluster
+        # ---------------------------------------------------
+        filter_frame = QGroupBox("Filtri per l'analisi:")
+        filter_frame.setStyleSheet(f"font-weight: bold; color: {BLU_PETROLIO};")
+        filter_layout = QVBoxLayout(filter_frame)
+
+        selection_frame = QWidget()
+        selection_layout = QHBoxLayout(selection_frame)
+
+        # Ottengo i valori unici di Cluster (escludo stringhe vuote)
+        if 'Cluster' in self.res_lps_output.columns:
+            cluster_values = self.res_lps_output['Cluster'].dropna().unique()
+            cluster_values = [x for x in cluster_values if x != "" and str(x).strip() != ""]
+        else:
+            cluster_values = []
+
+        cluster_names = sorted([str(x) for x in cluster_values])
+
+        self.cluster_selector = MultiSelectionWidget("Cluster", cluster_names)
+        selection_layout.addWidget(self.cluster_selector)
+
+        filter_layout.addWidget(selection_frame)
+        params_layout.addWidget(filter_frame)
+
+        container_layout.addWidget(self.params_widget)
+
+        # ---------------------------------------------------
+        # 5) Pulsanti in fondo: Mostra/Nascondi, Calcola, Salva, Chiudi
+        # ---------------------------------------------------
+        button_frame = QWidget()
+        button_layout = QHBoxLayout(button_frame)
+
+        self.toggle_button = QPushButton("Mostra/Nascondi Parametri")
+        self.toggle_button.clicked.connect(self.params_widget.toggle)
+        button_layout.addWidget(self.toggle_button)
+
+        self.calculate_button = QPushButton("Calcola Tassi")
+        self.calculate_button.setStyleSheet(f"background-color: {VERDE_SCURO}; color: {BIANCO}; font-weight: bold;")
+        self.calculate_button.clicked.connect(self.update_results)
+        button_layout.addWidget(self.calculate_button)
+
+        self.save_button = QPushButton("Salva Risultati")
+        self.save_button.setStyleSheet(f"background-color: {VERDE_CHIARO}; color: {BIANCO}; font-weight: bold;")
+        self.save_button.setEnabled(False)
+        self.save_button.clicked.connect(self.save_results)
+        button_layout.addWidget(self.save_button)
+
+        self.close_button = QPushButton("Chiudi")
+        self.close_button.clicked.connect(self.accept)
+        button_layout.addWidget(self.close_button)
+
+        container_layout.addWidget(button_frame)
+
+        # ---------------------------------------------------
+        # 6) Barra di stato
+        # ---------------------------------------------------
+        self.status_bar = QStatusBar()
+        self.status_bar.showMessage("Pronto")
+        container_layout.addWidget(self.status_bar)
+
+        main_scroll_area.setWidget(main_container)
+        main_layout.addWidget(main_scroll_area)
+
+        self.setLayout(main_layout)
+
+    # -------------------------------------------------------
+    # Quando cambia l'"Anno di valutazione", aggiorno i label degli anni
+    # -------------------------------------------------------
+    def on_last_year_changed(self, new_year):
+        """Gestisce il cambio dell'anno di valutazione"""
+        self.weight_distribution.update_year_labels(new_year)
+
+    # -------------------------------------------------------
+    # Quando cambia "Anni di osservazione", ricreo il WeightDistributionWidget
+    # -------------------------------------------------------
+    # ─────────────  NUOVA VERSIONE  ───────────
+    def update_weight_distribution(self):
+        """
+        Aggiorna la tabella dei pesi senza mai nascondere il widget:
+        – se l'utente imposta 1 anno, rimane una sola riga con 100 %
+        – se torna a 2, 3, … il widget si espande di nuovo.
+        """
+        n_obs = self.obs_years_spin.value()  # nuovo numero anni osservazione
+        last_year = self.last_year_spin.value()  # anno di valutazione corrente
+
+        # 1) aggiorna le etichette degli anni (2025, 2024, …)
+        self.weight_distribution.update_year_labels(last_year)
+
+        # 2) forza la griglia ad avere esattamente n_obs righe
+        self.weight_distribution.update_years(n_obs)
+
+        # 3) assicura che il widget resti visibile anche quando n_obs = 1
+        self.weight_distribution.setVisible(True)
+
+    def update_results(self):
+        """Calcola e visualizza i risultati dei tassi di riscatto per tutti e 3 i set"""
+        last_year = self.last_year_spin.value()
+        obs_years = self.obs_years_spin.value()
+        year_weights = self.weight_distribution.get_weights()
+        use_amounts = self.use_amounts_radio.isChecked()
+
+        total_weight = sum(year_weights)
+        if abs(total_weight - 100.0) > 0.1:
+            QMessageBox.warning(self, "Attenzione", "La somma dei pesi deve essere pari a 100%")
+            return
+
+        selected_clusters = self.cluster_selector.get_selected_items()
+
+        self.status_bar.showMessage("Elaborazione in corso...")
+
+        try:
+            worker = AnalysisWorker("", 0)
+
+            # Calcolo 3 set di dati
+            # 1. Tassi totali (include_total=True, include_partial=True)
+            lapse_rates_total = worker.calculate_lapse_rates(
+                self.res_lps_output, last_year, obs_years,
+                year_weights, use_amounts, True, True,
+                None, selected_clusters
+            )
+
+            # 2. Tassi solo definitivi (include_total=True, include_partial=False)
+            lapse_rates_definitivi = worker.calculate_lapse_rates(
+                self.res_lps_output, last_year, obs_years,
+                year_weights, use_amounts, True, False,
+                None, selected_clusters
+            )
+
+            # 3. Tassi solo reworkati (include_total=False, include_partial=True)
+            lapse_rates_reworkati = worker.calculate_lapse_rates(
+                self.res_lps_output, last_year, obs_years,
+                year_weights, use_amounts, False, True,
+                None, selected_clusters
+            )
+
+            # Salvo tutti e 3 i set
+            self.lapse_rates_data = {
+                'totali': lapse_rates_total,
+                'definitivi': lapse_rates_definitivi,
+                'reworkati': lapse_rates_reworkati
+            }
+
+            self.config = {
+                'last_year': last_year,
+                'obs_years': obs_years,
+                'weights': year_weights,
+                'use_amounts': use_amounts,
+                'clusters': selected_clusters
+            }
+
+            self.save_button.setEnabled(True)
+
+            # Mostra la nuova finestra con le 3 schermate
+            diagonal_view = DiagonalLapseRatesView(self.lapse_rates_data, self.config, self)
+            diagonal_view.exec()
+
+            self.status_bar.showMessage("Calcolo completato con successo!")
+
+        except Exception as e:
+            self.status_bar.showMessage(f"Errore: {str(e)[:50]}...")
+            QMessageBox.critical(self, "Errore",
+                                 f"Si è verificato un errore durante il calcolo dei tassi di riscatto: {e}")
+
+    def save_results(self):
+        """Salva i risultati in un file Excel"""
+        if hasattr(self, 'lapse_rates_data') and hasattr(self, 'config'):
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Salva risultati tassi di riscatto",
+                os.path.join(OUTPUT_PATH, 'Lapse_Rates_All_Types.xlsx'),
+                "Excel Files (*.xlsx);;All Files (*)"
+            )
+
+            if not file_path:
+                return
+
+            try:
+                with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                    # Metadata
+                    metadata_data = [
+                        ['Anno di valutazione', self.config['last_year']],
+                        ['Anni di osservazione', self.config['obs_years']],
+                        ['Distribuzione pesi', ", ".join([f"{w:.1f}%" for w in self.config['weights']])],
+                        ['Base di calcolo', 'Importi' if self.config['use_amounts'] else 'Numero pezzi'],
+                        ['Cluster', ", ".join(self.config['clusters']) if self.config['clusters'] else 'Tutti i cluster'],
+                        ['Data elaborazione', datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')]
+                    ]
+                    metadata = pd.DataFrame(metadata_data, columns=['Parametro', 'Valore'])
+                    metadata.to_excel(writer, sheet_name='Configurazione', index=False)
+
+                    # Salva i 3 set di dati
+                    for tipo, data in self.lapse_rates_data.items():
+                        prefix = tipo.capitalize()
+                        data['lapse_rates_by_year'].to_excel(writer, sheet_name=f'{prefix}_By_Year', index=False)
+                        data['lapse_rates_avg'].to_excel(writer, sheet_name=f'{prefix}_Avg', index=False)
+                        data['lapse_rates_by_year_pivot'].to_excel(writer, sheet_name=f'{prefix}_Pivot', index=False)
+                        data['lapse_rates_avg_pivot'].to_excel(writer, sheet_name=f'{prefix}_Avg_Pivot', index=False)
+
+                QMessageBox.information(self, "Esportazione Completata",
+                                        f"I risultati sono stati esportati in {file_path}")
+                self.status_bar.showMessage("Risultati salvati con successo.")
+
+            except Exception as e:
+                QMessageBox.critical(self, "Errore", f"Si è verificato un errore durante l'esportazione: {str(e)}")
+        else:
+            QMessageBox.warning(self, "Attenzione", "Calcolare prima i tassi di riscatto.")
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Lapse Results - Analisi")
+        self.setGeometry(100, 100, 800, 600)
+
+        self.init_ui()
+
+        self.results = {}
+        self.cluster_configuration = None
+
+    def init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        main_layout = QVBoxLayout(central_widget)
+
+        # Header
+        header_label = QLabel("Analisi Lapse Results")
+        header_label.setStyleSheet(
+            f"background-color: {BLU_PETROLIO}; color: {BIANCO}; padding: 15px; font-size: 18px; font-weight: bold;")
+        main_layout.addWidget(header_label)
+
+        # Frame parametri
+        param_frame = QFrame()
+        param_frame.setFrameShape(QFrame.StyledPanel)
+        param_frame.setFrameShadow(QFrame.Raised)
+        param_layout = QVBoxLayout(param_frame)
+
+        param_container = QGroupBox("Parametri di Esecuzione")
+        param_container.setStyleSheet(
+            f"QGroupBox {{ border: 1px solid {VERDE_SCURO}; border-radius: 5px; margin-top: 1ex; }} "
+            f"QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top center; padding: 0 3px; }}")
+        param_container_layout = QVBoxLayout(param_container)
+
+        # Business Type
+        param_business_frame = QWidget()
+        param_business_layout = QGridLayout(param_business_frame)
+
+        param_business_layout.addWidget(
+            QLabel("Tipo Business:", styleSheet=f"font-weight: bold; color: {BLU_PETROLIO};"),
+            0, 0
+        )
+
+        self.btype_combo = QComboBox()
+        self.btype_combo.addItems(["IND", "CPI", "OPF", "COLL"])
+        param_business_layout.addWidget(self.btype_combo, 0, 1)
+
+        description_label = QLabel(
+            "Indicatore del tipo di business (IND: TRAD+UL+TERM+PIP, CPI, OPF: OpenPensionFund, COLL: Group)",
+            styleSheet="font-style: italic; color: #777;"
+        )
+        param_business_layout.addWidget(description_label, 0, 2)
+
+        param_container_layout.addWidget(param_business_frame)
+
+        # Anno di decorrenza massima
+        param_uwy_frame = QWidget()
+        param_uwy_layout = QGridLayout(param_uwy_frame)
+
+        param_uwy_layout.addWidget(
+            QLabel("Fascia massima di antidurata:", styleSheet=f"font-weight: bold; color: {BLU_PETROLIO};"),
+            0, 0
+        )
+
+        self.uwy_max_combo = QComboBox()
+        self.uwy_max_combo.addItems(["≤ 5", "> 5 e ≤ 10", "> 10"])
+        self.uwy_max_combo.setCurrentText("> 10")
+        param_uwy_layout.addWidget(self.uwy_max_combo, 0, 1)
+
+        description_label = QLabel(
+            "Fascia massima di antidurata nei risultati",
+            styleSheet="font-style: italic; color: #777;"
+        )
+        param_uwy_layout.addWidget(description_label, 0, 2)
+
+        param_container_layout.addWidget(param_uwy_frame)
+
+        param_layout.addWidget(param_container)
+
+        # Pulsante selezione file
+        file_frame = QWidget()
+        file_layout = QHBoxLayout(file_frame)
+
+        self.select_files_button = QPushButton("Seleziona File di Input")
+        self.select_files_button.setStyleSheet(
+            f"background-color: {VERDE_CHIARO}; color: {BIANCO}; padding: 8px; font-weight: bold;")
+        self.select_files_button.clicked.connect(self.show_file_wizard)
+        file_layout.addWidget(self.select_files_button)
+
+        self.files_status_label = QLabel("Nessun file selezionato")
+        file_layout.addWidget(self.files_status_label, 1)
+
+        param_layout.addWidget(file_frame)
+
+        main_layout.addWidget(param_frame)
+
+        # Barra di progresso
+        progress_frame = QFrame()
+        progress_layout = QHBoxLayout(progress_frame)
+
+        progress_layout.addWidget(
+            QLabel("Progresso:", styleSheet=f"font-weight: bold; color: {BLU_PETROLIO};")
+        )
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                border: 1px solid grey;
+                border-radius: 3px;
+                text-align: center;
+            }}
+            QProgressBar::chunk {{
+                background-color: {VERDE_SCURO};
+                width: 10px;
+                margin: 0.5px;
+            }}
+        """)
+        progress_layout.addWidget(self.progress_bar)
+
+        main_layout.addWidget(progress_frame)
+
+        # Log sections
+        log_sections_widget = QWidget()
+        log_sections_layout = QHBoxLayout(log_sections_widget)
+        log_sections_layout.setContentsMargins(0, 0, 0, 0)
+        log_sections_layout.setSpacing(10)
+
+        # Log operazioni
+        log_section = QWidget()
+        log_section_layout = QVBoxLayout(log_section)
+        log_section_layout.setContentsMargins(0, 0, 0, 0)
+        log_section_layout.setSpacing(0)
+
+        log_title = QLabel("Log Operazioni")
+        log_title.setStyleSheet(f"color: {BLU_PETROLIO}; font-weight: bold; font-size: 12px; padding: 3px; " +
+                                f"border: 1px solid {VERDE_SCURO}; border-bottom: none; border-top-left-radius: 5px; border-top-right-radius: 5px;")
+        log_title.setAlignment(Qt.AlignCenter)
+        log_title.setMaximumHeight(25)
+        log_section_layout.addWidget(log_title)
+
+        self.output_text = QTextEdit()
+        self.output_text.setReadOnly(True)
+        self.output_text.setStyleSheet(f"background-color: {GRIGIO_CHIARO}; color: #333; " +
+                                       f"border: 1px solid {VERDE_SCURO}; border-top: none; border-bottom-left-radius: 5px; border-bottom-right-radius: 5px;")
+        log_section_layout.addWidget(self.output_text)
+
+        # Database properties
+        db_section = QWidget()
+        db_section_layout = QVBoxLayout(db_section)
+        db_section_layout.setContentsMargins(0, 0, 0, 0)
+        db_section_layout.setSpacing(0)
+
+        db_title = QLabel("Riepilogo database caricati")
+        db_title.setStyleSheet(f"color: {BLU_PETROLIO}; font-weight: bold; font-size: 12px; padding: 3px; " +
+                               f"border: 1px solid {VERDE_SCURO}; border-bottom: none; border-top-left-radius: 5px; border-top-right-radius: 5px;")
+        db_title.setAlignment(Qt.AlignCenter)
+        db_title.setMaximumHeight(25)
+        db_section_layout.addWidget(db_title)
+
+        self.db_info_text = QTextEdit()
+        self.db_info_text.setReadOnly(True)
+        self.db_info_text.setStyleSheet(f"background-color: #FFFFFF; color: #333; " +
+                                        f"border: 1px solid {VERDE_SCURO}; border-top: none; border-bottom-left-radius: 5px; border-bottom-right-radius: 5px;")
+        db_section_layout.addWidget(self.db_info_text)
+
+        log_sections_layout.addWidget(log_section)
+        log_sections_layout.addWidget(db_section)
+
+        main_layout.addWidget(log_sections_widget, 1)
+
+        # Pulsanti
+        button_frame = QFrame()
+        button_layout = QHBoxLayout(button_frame)
+
+        self.run_button = QPushButton("Esegui Analisi")
+        self.run_button.setEnabled(False)
+        self.run_button.setStyleSheet(f"background-color: {VERDE_SCURO}; color: {BIANCO}; font-weight: bold;")
+        self.run_button.clicked.connect(self.run_analysis)
+        button_layout.addWidget(self.run_button)
+
+        self.close_button = QPushButton("Chiudi")
+        self.close_button.clicked.connect(self.close)
+        button_layout.addWidget(self.close_button)
+
+        main_layout.addWidget(button_frame)
+
+        # Status bar
+        self.status_bar = QStatusBar()
+        self.status_bar.showMessage("Pronto")
+        self.setStatusBar(self.status_bar)
+
+        self.init_output_redirect()
+
+    def init_output_redirect(self):
+        """Inizializza il reindirizzamento dell'output standard"""
+        self.output_redirector = OutputRedirector()
+        self.output_redirector.outputWritten.connect(self.update_output)
+
+        self.old_stdout = sys.stdout
+        sys.stdout = self.output_redirector
+
+    def update_db_info(self):
+        """Mostra riepilogo dei DB unificati (righe, colonne, dimensione)."""
+
+        def format_size(size_bytes: int) -> str:
+            if size_bytes < 1024 ** 2:
+                return f"{size_bytes / 1024:.2f} KB"
+            if size_bytes < 1024 ** 3:
+                return f"{size_bytes / 1024 ** 2:.2f} MB"
+            return f"{size_bytes / 1024 ** 3:.2f} GB"
+
+        # -------- helper: riepiloga tutta la cartella -----------------
+        def summarize_folder(folder_path: str) -> tuple[int | str, int | str, int]:
+            """
+            Ritorna (n_colonne, n_righe, dimensione_byte) del DB
+            ottenuto accodando tutti i file supportati nella cartella.
+            Se qualcosa va storto → 'N/A'.
+            """
+            if not folder_path or not os.path.isdir(folder_path):
+                return "N/A", "N/A", 0
+
+            supported = ('.csv', '.txt', '.xlsx', '.sas7bdat')
+            total_rows = 0
+            all_cols: set[str] = set()
+            total_size = 0
+
+            for fname in os.listdir(folder_path):
+                if not fname.lower().endswith(supported):
+                    continue
+
+                fpath = os.path.join(folder_path, fname)
+                total_size += os.path.getsize(fpath)
+
+                try:  # --- colonne + righe ----------
+                    if fname.lower().endswith(('.csv', '.txt')):
+                        # rileva separatore alla prima riga
+                        with open(fpath, 'r', encoding='utf-8', errors='replace') as fh:
+                            first = fh.readline()
+                        sep = ';' if first.count(';') >= first.count(',') else ','
+                        # colonne
+                        head = pd.read_csv(fpath, sep=sep, nrows=0)
+                        all_cols.update([c.lower().strip() for c in head.columns])
+                        # quick row-count
+                        with open(fpath, 'r', encoding='utf-8', errors='replace') as fh:
+                            total_rows += max(0, sum(1 for _ in fh) - 1)
+
+                    elif fname.lower().endswith('.xlsx'):
+                        head = pd.read_excel(fpath, nrows=0)
+                        all_cols.update([c.lower().strip() for c in head.columns])
+                        # righe (solo prima sheet)
+                        total_rows += pd.read_excel(fpath, usecols=[0]).shape[0]
+
+                    elif fname.lower().endswith('.sas7bdat'):
+                        _, meta = pyreadstat.read_sas7bdat(fpath, metadataonly=True)
+                        all_cols.update([c.lower().strip() for c in meta.column_names])
+                        total_rows += meta.number_rows
+
+                except Exception:
+                    # se c’è un errore lascio il valore calcolato finora
+                    continue
+
+            ncols = len(all_cols) if all_cols else "N/A"
+            nrows = total_rows if total_rows else "N/A"
+            return ncols, nrows, total_size
+
+        # -------- costruzione HTML -----------------------------------
+        info_html = """
+        <style>
+            table.db-info {width:100%;border-collapse:collapse;font-family:Arial, sans-serif}
+            table.db-info th {background:#008037;color:white;font-weight:bold;padding:6px;border:1px solid #ddd;text-align:left}
+            table.db-info td {padding:6px;border:1px solid #ddd;vertical-align:top}
+            table.db-info tr:nth-child(even){background:#f2f2f2}
+        </style>
+        <table class="db-info">
+            <tr>
+                <th>Database</th><th>Cartella</th><th># colonne</th><th># righe</th><th>Dimensione</th><th>Path</th>
+            </tr>
+        """
+
+        datasets = [
+            ("Claims", getattr(self, "claims_path", "")),
+            ("Exposition", getattr(self, "exposition_path", ""))
+        ]
+
+        for db_name, folder in datasets:
+            n_cols, n_rows, tot_size = summarize_folder(folder)
+            info_html += f"""
+                <tr>
+                    <td><b>{db_name}</b></td>
+                    <td>{os.path.basename(folder) or '-'}</td>
+                    <td>{n_cols}</td>
+                    <td>{n_rows}</td>
+                    <td>{format_size(tot_size)}</td>
+                    <td>{folder}</td>
+                </tr>
+            """
+
+        info_html += "</table>"
+
+        # cluster info
+        if self.cluster_configuration:
+            info_html += (
+                "<h3>Configurazione Cluster</h3>"
+                "<p><b>Nome:</b> Cluster</p>"
+                f"<p><b>Basato su:</b> {', '.join(self.cluster_configuration['columns'])}</p>"
+            )
+
+        self.db_info_text.setHtml(info_html)
+
+    def show_file_wizard(self):
+        """Mostra il wizard per la selezione dei file"""
+        wizard = FileSelectionWizard(self)
+        result = wizard.exec()
+
+        if result == QWizard.Accepted:
+            # Salva la configurazione del cluster
+            self.cluster_configuration = wizard.cluster_configuration
+
+            required_paths = [DATABASE_CLAIMS_PATH, DATABASE_EXPOSITION_PATH, OUTPUT_PATH]
+            required_names = ["Claims", "Exposition", "Output"]
+
+            missing_paths = []
+            for i, path in enumerate(required_paths):
+                if not path or (required_names[i] != "Output" and not os.path.exists(path)):
+                    missing_paths.append(required_names[i])
+
+            if missing_paths:
+                QMessageBox.warning(self, "Attenzione",
+                                    f"I seguenti percorsi non sono stati definiti correttamente: {', '.join(missing_paths)}.\n"
+                                    "Si prega di selezionare nuovamente i file.")
+                self.files_status_label.setText("Selezione file incompleta")
+                self.run_button.setEnabled(False)
+                return
+
+            self.claims_path = DATABASE_CLAIMS_PATH
+            self.exposition_path = DATABASE_EXPOSITION_PATH
+            self.output_path = OUTPUT_PATH
+
+            if self.output_path and not os.path.exists(self.output_path):
+                try:
+                    os.makedirs(self.output_path)
+                    print(f"Cartella di output creata: {self.output_path}")
+                except Exception as e:
+                    QMessageBox.warning(self, "Attenzione",
+                                        f"Impossibile creare la cartella di output: {str(e)}")
+                    return
+
+            # Aggiorniamo il label usando 'Cluster' fisso anziché il campo 'name'
+            self.files_status_label.setText(
+                f"File selezionati:\n"
+                f"Claims: {os.path.basename(self.claims_path)}\n"
+                f"Exposition: {os.path.basename(self.exposition_path)}\n"
+                f"Cluster: Cluster\n"
+                f"Output: {self.output_path}"
+            )
+
+            self.update_db_info()
+
+            self.run_button.setEnabled(True)
+            self.run_button.setStyleSheet(
+                f"background-color: {VERDE_SCURO}; color: {BIANCO}; font-weight: bold; border: 2px solid {VERDE_CHIARO};")
+            self.status_bar.showMessage("File selezionati. Pronto per l'analisi.")
+
+    @Slot(str)
+    def update_output(self, text):
+        """Aggiorna il widget di output con nuovo testo"""
+        self.output_text.moveCursor(QTextCursor.End)
+        self.output_text.insertPlainText(text)
+        self.output_text.moveCursor(QTextCursor.End)
+        QApplication.processEvents()
+
+    def update_progress(self, value):
+        """Aggiorna la barra di progresso"""
+        self.progress_bar.setValue(value)
+        QApplication.processEvents()
+
+    def run_analysis(self):
+        """Esegue l'analisi in un thread separato"""
+        required_paths = [DATABASE_CLAIMS_PATH, DATABASE_EXPOSITION_PATH, OUTPUT_PATH]
+
+        if not all(required_paths):
+            QMessageBox.warning(self, "Attenzione", "Selezionare tutti i file necessari prima di eseguire l'analisi.")
+            return
+
+        if not self.cluster_configuration:
+            QMessageBox.warning(self, "Attenzione", "Configurare il cluster prima di eseguire l'analisi.")
+            return
+
+        self.output_text.clear()
+        self.progress_bar.setValue(0)
+
+        self.run_button.setEnabled(False)
+        self.btype_combo.setEnabled(False)
+        self.uwy_max_combo.setEnabled(False)
+        self.select_files_button.setEnabled(False)
+
+        self.status_bar.showMessage("Elaborazione in corso...")
+
+        btype = self.btype_combo.currentText()
+
+        # Converti la fascia selezionata nel valore numerico corrispondente
+        uwy_max_text = self.uwy_max_combo.currentText()
+        if uwy_max_text == "≤ 5":
+            uwy_max = 5
+        elif uwy_max_text == "> 5 e ≤ 10":
+            uwy_max = 7
+        else:  # "> 10"
+            uwy_max = 11
+
+        self.worker = AnalysisWorker(btype, uwy_max, self.cluster_configuration)
+
+        self.thread = QThread()
+        self.worker.moveToThread(self.thread)
+
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.on_analysis_finished)
+        self.worker.error_occurred.connect(self.on_analysis_error)
+        self.worker.progress_updated.connect(self.update_progress)
+        self.worker.status_updated.connect(self.status_bar.showMessage)
+
+        self.thread.start()
+
+    def on_analysis_finished(self, results):
+        """Callback quando l'analisi è completata con successo"""
+        self.results = results
+
+        QMessageBox.information(self, "Completato", "Calcolo Lapse Results completato con successo!")
+
+        self.show_lapse_rates_dialog()
+
+        self.cleanup_worker()
+
+    def on_analysis_error(self, error_message):
+        """Callback quando si verifica un errore durante l'analisi"""
+        QMessageBox.critical(self, "Errore", error_message)
+        self.cleanup_worker()
+
+    def cleanup_worker(self):
+        """Pulisce il worker e il thread"""
+        self.run_button.setEnabled(True)
+        self.btype_combo.setEnabled(True)
+        self.uwy_max_combo.setEnabled(True)
+        self.select_files_button.setEnabled(True)
+
+        self.status_bar.showMessage("Pronto")
+
+        if hasattr(self, 'thread') and self.thread.isRunning():
+            self.thread.quit()
+            self.thread.wait()
+
+    def show_lapse_rates_dialog(self):
+        """Mostra la finestra di dialogo per il calcolo dei tassi di riscatto"""
+        if 'res_lps_output' in self.results:
+            dialog = LapseRatesDialog(self.results['res_lps_output'], self)
+            dialog.exec()
+
+    def closeEvent(self, event):
+        """Gestisce l'evento di chiusura della finestra"""
+        sys.stdout = self.old_stdout
+        self.cleanup_worker()
+        event.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+
+    app.setStyle("Fusion")
+
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(BIANCO))
+    palette.setColor(QPalette.WindowText, QColor("#333333"))
+    palette.setColor(QPalette.Base, QColor(BIANCO))
+    palette.setColor(QPalette.AlternateBase, QColor(GRIGIO_CHIARO))
+    palette.setColor(QPalette.ToolTipBase, QColor(BIANCO))
+    palette.setColor(QPalette.ToolTipText, QColor(BLU_PETROLIO))
+    palette.setColor(QPalette.Text, QColor("#333333"))
+    palette.setColor(QPalette.Button, QColor(GRIGIO_CHIARO))
+    palette.setColor(QPalette.ButtonText, QColor(BLU_PETROLIO))
+    palette.setColor(QPalette.BrightText, QColor(VERDE_CHIARO))
+    palette.setColor(QPalette.Highlight, QColor(VERDE_SCURO))
+    palette.setColor(QPalette.HighlightedText, QColor(BIANCO))
+
+    app.setPalette(palette)
+
+    main_window = MainWindow()
+    main_window.showMaximized()
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
